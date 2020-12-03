@@ -64,6 +64,7 @@ public class ht8b : UdonSharpBehaviour
 	const float TABLE_WIDTH = 1.0668f;
 	const float TABLE_HEIGHT = 0.6096f;
 	const float BALL_DIAMETRE = 0.06f;
+	const float BALL_1OR = 16.66666666666666f;
 	const float BALL_RSQR = 0.0009f;
 	const float POCKET_RADIUS = 0.09f;
 	const float K_1OR2 = 0.70710678118f;   // 1 over root 2
@@ -223,8 +224,14 @@ public class ht8b : UdonSharpBehaviour
 		// Apply friction
 		ball_velocities[ id ] *= FRICTION_EFF;
 
+		Vector2 mov_delta = ball_velocities[id] * FIXED_TIME_STEP;
+		float mov_mag = mov_delta.magnitude;
+
 		// Apply movement
-		ball_positions[ id ] += ball_velocities[ id ] * FIXED_TIME_STEP;
+		ball_positions[ id ] += mov_delta;
+
+		// Rotate visual object by pure rolling
+		balls_render[ id ].transform.Rotate( new Vector3( mov_delta.y, 0.0f, -mov_delta.x ) / mov_mag, mov_mag * BALL_1OR * Mathf.Rad2Deg, Space.World );
 
 		// ball/ball collisions
 		for( int i = id+1; i < 16; i++ )
