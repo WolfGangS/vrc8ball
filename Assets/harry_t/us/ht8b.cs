@@ -37,8 +37,9 @@ public class ht8b : UdonSharpBehaviour
 
 	// REGION GAME STATE
 	// =========================================================================================================================
-	int		sn_turn = 0;			// Whos turn is it
-	uint		sn_pocketed = 0x00;	// Each bit represents each ball, if it has been pocketed or not
+	public int		sn_turn = 0;				// Whos turn is it
+	public bool		sn_simulating = false;	// True whilst balls are rolling
+	public uint		sn_pocketed = 0x00;		// Each bit represents each ball, if it has been pocketed or not
 	
 	// REGION PHYSICS ENGINE
 	// =========================================================================================================================
@@ -68,6 +69,7 @@ public class ht8b : UdonSharpBehaviour
 	const float K_1OR2 = 0.70710678118f;   // 1 over root 2
 	const float K_1OR5 = 0.4472135955f;    // 1 over root 5
 	const float POCKET_DEPTH = 0.04f;
+	const float MIN_VELOCITY = 0.00005625f;	// ( SQUARED )
 
 	const float FRICTION_EFF = 0.99f;
 
@@ -185,7 +187,7 @@ public class ht8b : UdonSharpBehaviour
 				i = (A.x * d + A.y - k) / (2.0f * d);
 				j = i * d + k;
 
-				ball_positions[ id ].Set( i, j );
+				ball_positions[ id ] = new Vector2( i, j );
 
 				// Reflect velocity
 				ball_velocities[ id ] = Vector2.Reflect( ball_velocities[ id ], N );
@@ -251,9 +253,14 @@ public class ht8b : UdonSharpBehaviour
 		}
 
 		// ball still moving about
-		if( ball_velocities[ id ].x > 0.001f && ball_velocities[ id ].y > 0.001f )
+		if( ball_velocities[ id ].sqrMagnitude > MIN_VELOCITY )
 		{
 			ballsMoving = true;
+		}
+		else
+		{
+			// Put velocity to 0
+			ball_velocities[ id ] = Vector2.zero;
 		}
 	}
 
@@ -296,12 +303,34 @@ public class ht8b : UdonSharpBehaviour
 		return start + dir * Vector2.Dot( pos - start, dir );
 	}
 
+	void TurnEnd()
+	{
+		// Check if white in
+		// Check if black in
+
+		Debug.Log( "[ht8b] TurnEnd()" );
+	}
+
 	void PhysicsUpdate()
 	{
+		ballsMoving = false;
+
 		// Run main simulation / inter-ball collision
 		for( int i = 0; i < 16; i ++ )
 		{
 			BallSimulate( i );
+		}
+
+		// Check if turn over
+		if( !ballsMoving )
+		{
+			if( sn_simulating )
+			{
+				sn_simulating = false;
+				TurnEnd();
+			}
+
+			return;
 		}
 
 		// Run edge collision
@@ -348,7 +377,6 @@ public class ht8b : UdonSharpBehaviour
 
 		while ( accum >= FIXED_TIME_STEP )
 		{
-			ball_velocities[0] += extraGravy;
 			PhysicsUpdate();
 			accum -= FIXED_TIME_STEP;
 		}
@@ -551,6 +579,8 @@ public class ht8b : UdonSharpBehaviour
 		ball_velocities[0] = Decodev2(arr, 16 * 4, 50.0f);
 
 		ltext.text = ( Networking.IsOwner(Networking.LocalPlayer, this.gameObject) ? "[OWNER] @" : "[RECVR] @" ) + Time.time.ToString() + ": " + netstr_hex();
+
+		sn_simulating = true;
 	}
 
 	string netstr_hex()
