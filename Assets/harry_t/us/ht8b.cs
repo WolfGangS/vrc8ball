@@ -34,6 +34,11 @@ public class ht8b : UdonSharpBehaviour
 
 	[SerializeField]
 	Vector2 extraGravy;
+
+	// REGION GAME STATE
+	// =========================================================================================================================
+	int		sn_turn = 0;			// Whos turn is it
+	uint		sn_pocketed = 0x00;	// Each bit represents each ball, if it has been pocketed or not
 	
 	// REGION PHYSICS ENGINE
 	// =========================================================================================================================
@@ -59,10 +64,10 @@ public class ht8b : UdonSharpBehaviour
 	const float TABLE_HEIGHT = 0.6096f;
 	const float BALL_DIAMETRE = 0.06f;
 	const float BALL_RSQR = 0.0009f;
-	const float POCKET_RADIUS = 0.1f;
-	const float POCKET_INNER = 0.14142135623f;
+	const float POCKET_RADIUS = 0.09f;
 	const float K_1OR2 = 0.70710678118f;   // 1 over root 2
-	const float K_1OR5 = 0.4472135955f;		// 1 over root 5
+	const float K_1OR5 = 0.4472135955f;    // 1 over root 5
+	const float POCKET_DEPTH = 0.04f;
 
 	const float FRICTION_EFF = 0.99f;
 
@@ -75,9 +80,57 @@ public class ht8b : UdonSharpBehaviour
 		}
 	}
 
+	void PocketBall( int id )
+	{
+		uint total = 0U;
+
+		// Get total for X positioning
+		for( int i = 0; i < 16; i ++ )
+		{
+			total += (sn_pocketed >> i) & 0x1U;
+		}
+
+		// Put balls on the edge of the table for now
+		// TODO: propper display
+		ball_positions[ id ].x = -TABLE_WIDTH + (float)total * BALL_DIAMETRE;
+		ball_positions[ id ].y = TABLE_HEIGHT + BALL_DIAMETRE * 2.0f;
+
+		sn_pocketed ^= 1U << id;
+	}
+
+	// TODO: Inline
+	bool BallInPlay( int id )
+	{
+		return ((sn_pocketed >> id) & 0x1U) == 0x00U;
+	}
+
+	void BallPockets( int id )
+	{
+		if( !BallInPlay( id ) )
+			return;
+
+		float zy, zx;
+		Vector2 A;
+
+		A = ball_positions[ id ];
+
+		// Setup major regions
+		zx = A.x > 0.0f ? 1.0f: -1.0f;
+		zy = A.y > 0.0f ? 1.0f: -1.0f;
+
+		// Its in a pocket
+		if( A.y*zy > TABLE_HEIGHT + POCKET_DEPTH || A.y*zy > A.x*-zx + TABLE_WIDTH+TABLE_HEIGHT + POCKET_DEPTH )
+		{
+			PocketBall( id );
+		}
+	}
+
 	// TODO: inline this
 	void BallEdges( int id )
 	{
+		if( !BallInPlay( id ) )
+			return;
+
 		float zy, zx, zz, zw, d, k, i, j, l, r;
 		Vector2 A, N;
 
@@ -96,26 +149,26 @@ public class ht8b : UdonSharpBehaviour
 		 * 
 		 */
 
-		// Setup regions
+		// Setup major regions
 		zx = A.x > 0.0f ? 1.0f: -1.0f;
 		zy = A.y > 0.0f ? 1.0f: -1.0f;
-		zw = A.y*zy > A.x*zx - TABLE_WIDTH + TABLE_HEIGHT ? 1.0f: -1.0f;
-
-		if ( A.x*zx > TABLE_WIDTH * 0.5f )
-		{
-			zz = 1.0f;
-			r = K_1OR2;
-		}
-		else
-		{
-			zz = -2.0f;
-			r = K_1OR5;
-		}
 
 		// within pocket regions
 		if( (A.y*zy > (TABLE_HEIGHT-POCKET_RADIUS)) && (A.x*zx > (TABLE_WIDTH-POCKET_RADIUS) || A.x*zx < POCKET_RADIUS) )
 		{
-			//if( A.x*zx )
+			// Subregions
+			zw = A.y * zy > A.x * zx - TABLE_WIDTH + TABLE_HEIGHT ? 1.0f : -1.0f;
+
+			if (A.x * zx > TABLE_WIDTH * 0.5f)
+			{
+				zz = 1.0f;
+				r = K_1OR2;
+			}
+			else
+			{
+				zz = -2.0f;
+				r = K_1OR5;
+			}
 
 			// Collider line EQ
 			d = zx * zy * zz; // Coefficient
@@ -162,6 +215,9 @@ public class ht8b : UdonSharpBehaviour
 
 	void BallSimulate( int id )
 	{
+		if( !BallInPlay( id ) )
+			return;
+
 		// Apply friction
 		ball_velocities[ id ] *= FRICTION_EFF;
 
@@ -171,6 +227,9 @@ public class ht8b : UdonSharpBehaviour
 		// ball/ball collisions
 		for( int i = id+1; i < 16; i++ )
 		{
+			if( !BallInPlay( id ) )
+				continue;
+
 			Vector2 delta = ball_positions[ i ] - ball_positions[ id ];
 			float dist = delta.magnitude;
 
@@ -190,8 +249,6 @@ public class ht8b : UdonSharpBehaviour
 				}
 			}
 		}
-
-		BallEdges( id );
 
 		// ball still moving about
 		if( ball_velocities[ id ].x > 0.001f && ball_velocities[ id ].y > 0.001f )
@@ -241,9 +298,22 @@ public class ht8b : UdonSharpBehaviour
 
 	void PhysicsUpdate()
 	{
-		for (int i = 0; i < 16; i++)
+		// Run main simulation / inter-ball collision
+		for( int i = 0; i < 16; i ++ )
 		{
 			BallSimulate( i );
+		}
+
+		// Run edge collision
+		for( int i = 0; i < 16; i ++ )
+		{
+			BallEdges( i );
+		}
+
+		// Run triggers
+		for( int i = 0; i < 16; i ++ )
+		{
+			BallPockets( i );
 		}
 	}
 
@@ -337,7 +407,7 @@ public class ht8b : UdonSharpBehaviour
 				devhit.SetActive( true );
 				devhit.transform.position = new Vector3( RayCircle_output.x, 0.0f, RayCircle_output.y );
 
-				Vector2 scuffdir = ( ball_positions[0] - RayCircle_output ).normalized;
+				Vector2 scuffdir = ( ball_positions[0] - RayCircle_output ).normalized * 0.5f;
 
 				cue_vdir += scuffdir;
 				cue_vdir = cue_vdir.normalized;
@@ -372,10 +442,13 @@ public class ht8b : UdonSharpBehaviour
 
 	public void SetupBreak()
 	{
-		for (int i = 0; i < 16; i++)
+		sn_pocketed = 0x00;
+
+		for( int i = 0; i < 16; i ++ )
 		{
-			ball_positions[i] = ball_originals[i];
-			ball_velocities[i] = Vector2.zero;
+			ball_positions[ i ] = ball_originals[ i ];
+			ball_velocities[ i ] = Vector2.zero;
+			balls_render[ i ].SetActive( true );
 		}
 	}
 
