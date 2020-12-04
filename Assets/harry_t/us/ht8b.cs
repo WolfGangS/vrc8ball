@@ -1,9 +1,11 @@
-﻿
+﻿//#define USE_FIXED_POINT
+
 using UdonSharp;
 using UnityEngine;
 using UnityEngine.UI;
 using VRC.SDKBase;
 using VRC.Udon;
+using System;
 
 public class ht8b : UdonSharpBehaviour
 {
@@ -40,17 +42,13 @@ public class ht8b : UdonSharpBehaviour
 	public int		sn_turn = 0;				// Whos turn is it
 	public bool		sn_simulating = false;	// True whilst balls are rolling
 	public uint		sn_pocketed = 0x00;		// Each bit represents each ball, if it has been pocketed or not
+
+	bool				sn_updatelock = false;	// We are waiting for our local simulation to finish, before we unpack data
 	
 	// REGION PHYSICS ENGINE
 	// =========================================================================================================================
 
 	bool ballsMoving = false;
-
-	public Vector2[] ball_positions = new Vector2[16];
-	Vector2[] ball_originals = new Vector2[16];
-
-	
-	public Vector2[] ball_velocities = new Vector2[16];
 
 	Vector3 cue_lpos;
 	Vector2 cue_llpos;
@@ -74,9 +72,17 @@ public class ht8b : UdonSharpBehaviour
 
 	const float FRICTION_EFF = 0.99f;
 
+	public Vector2[]	ball_positions = new Vector2[16];
+	Vector2[]			ball_originals = new Vector2[16];
+	public Vector2[] ball_velocities = new Vector2[16];
+
+	// Components
+	AudioSource aud_click;
+
 	void ClampBallVelSemi( int id, Vector2 surface )
 	{
 		// TODO: improve this method to be a bit more accurate
+
 		if( Vector2.Dot( ball_velocities[id], surface ) < 0.0f )
 		{
 			ball_velocities[id] = ball_velocities[id].magnitude * surface;
@@ -255,6 +261,9 @@ public class ht8b : UdonSharpBehaviour
 					Vector2 reflection = normal * dot;
 					ball_velocities[id] -= reflection;
 					ball_velocities[i] += reflection;
+
+					aud_click.volume = Mathf.Clamp( ball_velocities[id].sqrMagnitude * 0.2f, 0.0f, 1.0f );
+					aud_click.Play();
 				}
 			}
 		}
@@ -310,12 +319,20 @@ public class ht8b : UdonSharpBehaviour
 		return start + dir * Vector2.Dot( pos - start, dir );
 	}
 
-	void TurnEnd()
+	void SimEnd()
 	{
-		// Check if white in
-		// Check if black in
+		sn_simulating = false;
 
-		Debug.Log( "[ht8b] TurnEnd()" );
+		FRP( "(local) SimEnd()" );
+
+		// Check if there was a network update on hold
+		if( sn_updatelock )
+		{
+			FRP( "Update was waiting, executing now" );
+			sn_updatelock = false;
+
+			NetRead();
+		}
 	}
 
 	void PhysicsUpdate()
@@ -328,13 +345,12 @@ public class ht8b : UdonSharpBehaviour
 			BallSimulate( i );
 		}
 
-		// Check if turn over
+		// Check if simulation has settled
 		if( !ballsMoving )
 		{
 			if( sn_simulating )
 			{
-				sn_simulating = false;
-				TurnEnd();
+				SimEnd();
 			}
 
 			return;
@@ -380,12 +396,17 @@ public class ht8b : UdonSharpBehaviour
 		}
 
 		timeLast = time;
-		accum += timeDelta;
-
-		while ( accum >= FIXED_TIME_STEP )
+		
+		// Run sim only if things are moving
+		if( sn_simulating )
 		{
-			PhysicsUpdate();
-			accum -= FIXED_TIME_STEP;
+			accum += timeDelta;
+
+			while ( accum >= FIXED_TIME_STEP )
+			{
+				PhysicsUpdate();
+				accum -= FIXED_TIME_STEP;
+			}
 		}
 
 		// float alpha = accum * TIME_ALPHA;
@@ -426,9 +447,9 @@ public class ht8b : UdonSharpBehaviour
 
 				bArmed = false;
 
-				// Commit and read to sync results accross clients
+				// Commit changes
+				sn_simulating = true;
 				NetPack();
-				NetRead();
 			}
 		}
 		else
@@ -465,6 +486,10 @@ public class ht8b : UdonSharpBehaviour
 
 	private void Start()
 	{
+		FRP( "Starting" );
+
+		aud_click = this.GetComponent<AudioSource>();
+
 		// randomize positions and velocities
 		for( int i = 0; i < 16; i ++ ) 
 		{
@@ -472,7 +497,10 @@ public class ht8b : UdonSharpBehaviour
 			ball_originals[i].y = balls_render[i].transform.position.z;
 		}
 
-		SendDebugImpulse();
+		SetupBreak();
+
+		NetPack();
+		NetRead();
 	}
 
 	public void SetupBreak()
@@ -489,15 +517,11 @@ public class ht8b : UdonSharpBehaviour
 
 	public void SendDebugImpulse()
 	{
+		FRP( "Resetting" );
+
 		SetupBreak();
 
-		//ball_positions[0].x = -0.758f;
-		//ball_positions[0].y = 0.0f;
-
-		//ball_velocities[0].x = UnityEngine.Random.Range( 0.5f, 8.0f );
-		//ball_velocities[0].y = UnityEngine.Random.Range( -0.06f, 0.06f );
-
-		// Rencode positions to ensure truncation is the same on all clients
+		// Re-encode positions
 		NetPack();
 		NetRead();
 	}
@@ -559,35 +583,44 @@ public class ht8b : UdonSharpBehaviour
 		// Cue ball velocity last
 		enc += Encodev2( ball_velocities[0], 50.0f );
 
+		// Encode pocketed imformation
+		enc += EncodeUint16( (ushort)(sn_pocketed & 0x0000FFFFU) );
+
+		// Game state. TODO: put other stuff here
+		enc += EncodeUint16( sn_simulating? (ushort)0x1U : (ushort)0x0U );
+
 		netstr = enc;
 
-		Debug.Log( "[ht8b] NETPACK: " + netstr );
+		FRP( "NetPack()" );
 	}
 
 	// Decode networking string
 	public void NetRead()
 	{
-		Debug.Log("[ht8b] NETREAD: " + netstr);
-
-		if (netstr.Length < 17 * 4)
+		if( netstr.Length < 18 * 4 )
 		{
-			Debug.Log("Sync string too short for decode, skipping\n");
+			FRP( "Sync string too short for decode, skipping\n" );
 			return;
 		}
 
 		char[] arr = netstr.ToCharArray();
 
-		for (int i = 0; i < 16; i++)
+		for( int i = 0; i < 16; i ++ )
 		{
 			ball_velocities[i] = Vector2.zero;
-			ball_positions[i] = Decodev2(arr, i * 4, 2.5f);
+			ball_positions[i] = Decodev2( arr, i * 4, 2.5f );
 		}
 
-		ball_velocities[0] = Decodev2(arr, 16 * 4, 50.0f);
+		ball_velocities[0] = Decodev2( arr, 16 * 4, 50.0f );
 
-		ltext.text = ( Networking.IsOwner(Networking.LocalPlayer, this.gameObject) ? "[OWNER] @" : "[RECVR] @" ) + Time.time.ToString() + ": " + netstr_hex();
+		// Pocketed information
+		sn_pocketed = DecodeUint16( arr, 17 * 4 );
 
-		sn_simulating = true;
+		// Game state
+		uint gamestate = DecodeUint16( arr, 17 * 4 + 1 );
+		sn_simulating = (gamestate & 0x1U) == 0x1U;
+
+		FRP( "S " + netstr_hex() );
 	}
 
 	string netstr_hex()
@@ -609,9 +642,67 @@ public class ht8b : UdonSharpBehaviour
 	{
 		if( !string.Equals( netstr, netstr_prv ) )
 		{
-			Debug.Log( "netstr update" );
+			FRP( "OnDeserialization() :: netstr update" );
+
 			netstr_prv = netstr;
-			NetRead();
+
+			// Check if local simulation is in progress, the event will fire off later when physics
+			// are settled by the client
+			if( sn_simulating )
+			{
+				FRP( "local simulation is still running, the network update will occur after completion" );
+				sn_updatelock = true;
+			}
+			else
+			{
+				// We are free to read this update
+				NetRead();
+			}
 		}
+	}
+
+	const int FRP_MAX = 32;
+	int FRP_LEN = 0;
+	int FRP_PTR = 0;
+	string[] FRP_LINES = new string[32];
+
+	// Print a line to the debugger
+	void FRP( string ln )
+	{
+		Debug.Log( "[<color=\"#B5438F\">ht8b</color>] " + ln );
+
+		FRP_LINES[ FRP_PTR ++ ] = "[<color=\"#B5438F\">ht8b</color>] " + ln + "\n";
+		FRP_LEN ++ ;
+
+		if( FRP_PTR >= FRP_MAX )
+		{
+			FRP_PTR = 0;
+		}
+
+		if( FRP_LEN > FRP_MAX )
+		{
+			FRP_LEN = FRP_MAX;
+		}
+
+		string output = "";
+		
+		// Add information about game state:
+		output += Networking.IsOwner(Networking.LocalPlayer, this.gameObject) ? 
+			"<color=\"#95a2b8\">net(</color> <color=\"#4287F5\">OWNER</color> <color=\"#95a2b8\">)</color> ":
+			"<color=\"#95a2b8\">net(</color> <color=\"#678AC2\">RECVR</color> <color=\"#95a2b8\">)</color> ";
+
+		output += sn_simulating ?
+			"<color=\"#95a2b8\">sim(</color> <color=\"#4287F5\">ACTIVE</color> <color=\"#95a2b8\">)</color> ":
+			"<color=\"#95a2b8\">sim(</color> <color=\"#678AC2\">PAUSED</color> <color=\"#95a2b8\">)</color> ";
+
+		output += "\n---------------------------------------------------------------------------------------------------------------------------------------------------------\n";
+
+		// Update display
+		for( int i = 0; i < FRP_LEN ; i ++ )
+		{
+			output += FRP_LINES[ (FRP_MAX + FRP_PTR - FRP_LEN + i) % FRP_MAX ];
+		}
+
+		ltext.text = output;
 	}
 }
