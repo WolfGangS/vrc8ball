@@ -40,7 +40,11 @@ public class ht8b : UdonSharpBehaviour
 	// REGION GAME STATE
 	// =========================================================================================================================
 	public bool	sn_simulating = false;	// True whilst balls are rolling
-	public uint	sn_pocketed = 0x00;		// Each bit represents each ball, if it has been pocketed or not
+	public uint	sn_pocketed = 0x00;     // Each bit represents each ball, if it has been pocketed or not
+	public uint sn_pocketed_prv = 0x00; // What was the pocketed balls before we started the simulation
+
+	public uint sn_playerxor = 0x00;		// What colour the players have chosen
+	public bool sn_open = false;			// Is the table open?
 
 	public bool	sn_updatelock = false;	// We are waiting for our local simulation to finish, before we unpack data
 	public uint	sn_turnid = 0x00U;		// Whos turn is it, 0 or 1
@@ -348,6 +352,9 @@ public class ht8b : UdonSharpBehaviour
 				ball_positions[0] = ball_originals[0];
 				ball_velocities[0] = Vector2.zero;
 
+				// Save out position
+				NetPack( sn_turnid );
+
 				// https://vrchat.canny.io/vrchat-udon-closed-alpha-feedback/p/bitwisenot-for-integer-built-in-types
 				// sn_pocketed &= ~0x1U;
 
@@ -358,6 +365,12 @@ public class ht8b : UdonSharpBehaviour
 		sn_permit = true;
 		sn_foul = false;
 		sn_firsthit = 0;
+	}
+
+	// Show player what set of balls he is
+	void DisplaySetLocal()
+	{
+		
 	}
 
 	void SimEnd()
@@ -371,11 +384,28 @@ public class ht8b : UdonSharpBehaviour
 			// Owner state checks
 			FRP( FRP_LOW + "Post-move state checking" + FRP_END );
 
+			// We might need this later
+			uint bmask = 0x1FCU << ((int)(sn_playerxor ^ sn_turnid) * 7);
+
 			// Check for fouls
 			if( (sn_pocketed & 0x1U) == 0x1U )
 			{
 				FRP( FRP_ERR + "FOUL: scratched" + FRP_END );
 				sn_foul = true;
+
+				// TODO: remove code dupe
+				if(((sn_pocketed & bmask) != bmask && (sn_pocketed & 0x2U) == 0x2U))
+				{
+					FRP( FRP_ERR + "LOSS: sunk white and black" + FRP_END );
+				}
+			}
+			else if( (sn_pocketed & bmask) != bmask && (sn_pocketed & 0x2U) == 0x2U )
+			{
+				FRP( FRP_ERR + "LOSS: potted 8 ball before completing set" + FRP_END );
+				sn_foul = true;
+
+				// Not sure what do to with this bit yet
+				// TODO
 			}
 			else
 			{
@@ -388,11 +418,10 @@ public class ht8b : UdonSharpBehaviour
 				}
 				else
 				{
-					// Currently no check for spot/stripes, but is for 8 ball ALWAYS
-					// todo: allow this when player is on final
-					if ( sn_firsthit == 1 )
+					// Check for non-objective
+					if(((0x1 << sn_firsthit) & bmask) == 0x00 && ((bmask & sn_pocketed) != bmask ) && !sn_open)
 					{
-						FRP( FRP_ERR + "FOUL: cue hit 8 first" + FRP_END );
+						FRP( FRP_ERR + "FOUL: cue hit non objective ball" + FRP_END );
 						sn_foul = true;
 					}
 				}
@@ -410,8 +439,69 @@ public class ht8b : UdonSharpBehaviour
 			{
 				FRP( FRP_YES + "Legal move confirmed" + FRP_END );
 
-				// Everything was fine, player can go againf
-				NewTurn();
+				bool oppturn = false;
+
+				// Check if we pocketed a ball that is our type
+				if( sn_open )
+				{
+					// Every ball in game in mainplay is valid
+					if((sn_pocketed & 0xFFFC) > (sn_pocketed_prv & 0xFFFC))
+					{
+						// Player triggered turn xor
+						// check which group has the most sinks and 
+						if((sn_pocketed & 0x1FC) > (sn_pocketed & 0xFE00))
+						{
+							sn_playerxor = sn_turnid;
+							FRP( FRP_YES + "(local) Player is oranges!" + FRP_END );
+						}
+						else
+						{
+							sn_playerxor = sn_turnid ^ 0x1u;
+							FRP( FRP_YES + "(local) Player is blues!" + FRP_END );
+						}
+
+						DisplaySetLocal();
+						sn_open = false;
+					}
+					else
+					{
+						oppturn = true;
+					}
+				}
+				else
+				{
+					// Check we sunk at least one correct ball
+					if((sn_pocketed & bmask) > (sn_pocketed_prv & bmask))
+					{
+						FRP( FRP_YES + "Objective ball sunk, continuing" + FRP_END );
+					}
+					else
+					{
+						if((sn_pocketed & bmask) == bmask && (sn_pocketed & 0x2U) == 0x2U)
+						{
+							FRP( FRP_YES + "(local) Player wins!" + FRP_END );
+							// TODO: winning thing
+						}
+						else
+						{
+							FRP( FRP_LOW + "No objective ball made" + FRP_END );
+							oppturn = true;
+						}
+					}
+				}
+
+				if( oppturn )
+				{
+					FRP( FRP_LOW + "Turn will not be extended, transferring ownership" + FRP_END );
+
+					NetPack(sn_turnid ^ 0x1U);
+					NetRead();
+				}
+				else
+				{
+					// Everything was fine, player can go againf
+					NewTurn();
+				}
 			}
 		}
 		else
@@ -547,6 +637,8 @@ public class ht8b : UdonSharpBehaviour
 
 					// Commit changes
 					sn_simulating = true;
+					sn_pocketed_prv = sn_pocketed;
+
 					NetPack( sn_turnid );
 					NetRead();
 				}
@@ -609,7 +701,12 @@ public class ht8b : UdonSharpBehaviour
 		FRP( FRP_LOW + "SetupBreak()" + FRP_END );
 
 		sn_pocketed = 0x00;
+		sn_pocketed_prv = 0x00;
 		sn_simulating = false;
+		sn_open = true;
+
+		// Doesnt need to be set but for consistencys sake
+		sn_playerxor = 0;
 
 		for( int i = 0; i < 16; i ++ )
 		{
@@ -718,6 +815,8 @@ public class ht8b : UdonSharpBehaviour
 		if( sn_simulating ) flags |= 0x1U;
 		flags |= _turnid << 1;
 		if( sn_foul ) flags |= 0x4U;
+		if( sn_open ) flags |= 0x8U;
+		flags |= sn_playerxor << 4;
 
 		enc += EncodeUint16( (ushort)flags );
 
@@ -754,6 +853,8 @@ public class ht8b : UdonSharpBehaviour
 		uint gamestate = DecodeUint16( arr, 17 * 4 + 2 );
 		sn_simulating = (gamestate & 0x1U) == 0x1U;
 		sn_foul = (gamestate & 0x4U) == 0x4U;
+		sn_open = (gamestate & 0x8U) == 0x8U;
+		sn_playerxor = (gamestate & 0x10U) >> 4;
 
 		uint newturn = (gamestate & 0x2U) >> 1;
 		if( sn_turnid != newturn )
@@ -853,7 +954,7 @@ public class ht8b : UdonSharpBehaviour
 			FRP_LEN = FRP_MAX;
 		}
 
-		string output = "";
+		string output = "ht8b 0.0.3a ";
 		
 		// Add information about game state:
 		output += Networking.IsOwner(Networking.LocalPlayer, this.gameObject) ? 
@@ -868,7 +969,7 @@ public class ht8b : UdonSharpBehaviour
 
 		output += "\n---------------------------------------------------------------------------------------------------------------------------------------------------------\n";
 
-		// Update display
+		// Update display 
 		for( int i = 0; i < FRP_LEN ; i ++ )
 		{
 			output += FRP_LINES[ (FRP_MAX + FRP_PTR - FRP_LEN + i) % FRP_MAX ];
