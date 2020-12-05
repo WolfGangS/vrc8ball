@@ -29,21 +29,24 @@ public class ht8b : UdonSharpBehaviour
 	Text ltext;
 
 	[SerializeField]
-	public bool bAiming = true;
-
-	[SerializeField]
 	public bool bArmed = false;
 
 	[SerializeField]
 	Vector2 extraGravy;
 
+	[SerializeField]
+	public GameObject[] playerTotems;
+
 	// REGION GAME STATE
 	// =========================================================================================================================
-	public int		sn_turn = 0;				// Whos turn is it
-	public bool		sn_simulating = false;	// True whilst balls are rolling
-	public uint		sn_pocketed = 0x00;		// Each bit represents each ball, if it has been pocketed or not
+	public bool	sn_simulating = false;	// True whilst balls are rolling
+	public uint	sn_pocketed = 0x00;		// Each bit represents each ball, if it has been pocketed or not
 
-	bool				sn_updatelock = false;	// We are waiting for our local simulation to finish, before we unpack data
+	public bool	sn_updatelock = false;	// We are waiting for our local simulation to finish, before we unpack data
+	public uint	sn_turnid = 0x00U;		// Whos turn is it, 0 or 1
+	public bool	sn_permit = false;		// Permission for local player to play
+	public int	sn_firsthit = 0;        // The first ball to be hit by cue ball
+	public bool sn_foul = false;			// End-of-turn foul marker
 	
 	// REGION PHYSICS ENGINE
 	// =========================================================================================================================
@@ -78,6 +81,12 @@ public class ht8b : UdonSharpBehaviour
 
 	// Components
 	AudioSource aud_click;
+
+	const string FRP_LOW =	"<color=\"#ADADAD\">";
+	const string FRP_ERR =	"<color=\"#B84139\">";
+	const string FRP_WARN = "<color=\"#DEC521\">";
+	const string FRP_YES =	"<color=\"#69D128\">";
+	const string FRP_END =	"</color>";
 
 	void ClampBallVelSemi( int id, Vector2 surface )
 	{
@@ -262,8 +271,14 @@ public class ht8b : UdonSharpBehaviour
 					ball_velocities[id] -= reflection;
 					ball_velocities[i] += reflection;
 
-					aud_click.volume = Mathf.Clamp( ball_velocities[id].sqrMagnitude * 0.2f, 0.0f, 1.0f );
+					//aud_click.volume = Mathf.Clamp( ball_velocities[id].sqrMagnitude * 0.2f, 0.0f, 1.0f ); 
 					aud_click.Play();
+
+					// First hit detected
+					if( id == 0 && sn_firsthit == 0 )
+					{
+						sn_firsthit = i;
+					}
 				}
 			}
 		}
@@ -319,19 +334,96 @@ public class ht8b : UdonSharpBehaviour
 		return start + dir * Vector2.Dot( pos - start, dir );
 	}
 
+	void NewTurn()
+	{
+		FRP( FRP_YES + "NewTurn()" + FRP_END );
+
+		// Fixup game state
+		if( sn_foul )
+		{
+			FRP( FRP_LOW + "Game state fixup" + FRP_END );
+
+			if( (sn_pocketed & 0x1U) == 0x1U )
+			{
+				ball_positions[0] = ball_originals[0];
+				ball_velocities[0] = Vector2.zero;
+
+				// https://vrchat.canny.io/vrchat-udon-closed-alpha-feedback/p/bitwisenot-for-integer-built-in-types
+				// sn_pocketed &= ~0x1U;
+
+				sn_pocketed &= 0xFFFFFFFEU;
+			}
+		}
+
+		sn_permit = true;
+		sn_foul = false;
+		sn_firsthit = 0;
+	}
+
 	void SimEnd()
 	{
 		sn_simulating = false;
 
-		FRP( "(local) SimEnd()" );
+		FRP( FRP_LOW + "(local) SimEnd()" + FRP_END );
 
-		// Check if there was a network update on hold
-		if( sn_updatelock )
+		if( Networking.GetOwner( this.gameObject ) == Networking.LocalPlayer )
 		{
-			FRP( "Update was waiting, executing now" );
-			sn_updatelock = false;
+			// Owner state checks
+			FRP( FRP_LOW + "Post-move state checking" + FRP_END );
 
-			NetRead();
+			// Check for fouls
+			if( (sn_pocketed & 0x1U) == 0x1U )
+			{
+				FRP( FRP_ERR + "FOUL: scratched" + FRP_END );
+				sn_foul = true;
+			}
+			else
+			{
+				// Check first hit rules
+				// No hit
+				if ( sn_firsthit == 0 )
+				{
+					FRP( FRP_ERR + "FOUL: cue diddn't hit anything" + FRP_END );
+					sn_foul = true;
+				}
+				else
+				{
+					// Currently no check for spot/stripes, but is for 8 ball ALWAYS
+					// todo: allow this when player is on final
+					if ( sn_firsthit == 1 )
+					{
+						FRP( FRP_ERR + "FOUL: cue hit 8 first" + FRP_END );
+						sn_foul = true;
+					}
+				}
+			}
+
+			if( sn_foul )
+			{
+				// Flip player bit and commit, reciever will take ownership once update propogates
+				FRP( FRP_LOW + "Transferring ownership" + FRP_END );
+
+				NetPack( sn_turnid ^ 0x1U );
+				NetRead();
+			}
+			else
+			{
+				FRP( FRP_YES + "Legal move confirmed" + FRP_END );
+
+				// Everything was fine, player can go againf
+				NewTurn();
+			}
+		}
+		else
+		{
+			// Check if there was a network update on hold
+			if( sn_updatelock )
+			{
+				FRP( FRP_LOW + "Update was waiting, executing now" + FRP_END );
+				sn_updatelock = false;
+
+				NetRead();
+			}
 		}
 	}
 
@@ -418,66 +510,74 @@ public class ht8b : UdonSharpBehaviour
 		}
 
 		//Debug.Log( ball_velocities[0].magnitude * FIXED_TIME_STEP );
-
 		
 		cue_lpos = cuetip.transform.position;
 		Vector2 lpos2 = new Vector2( cue_lpos.x, cue_lpos.z );
 		
-		if( bArmed )
+		// Check if we are allowed to play
+		if( sn_permit )
 		{
-			float sweep_time_ball = Vector2.Dot( ball_positions[0] - cue_llpos, cue_vdir );
-
-			// Check for potential skips due to low frame rate
-			if( sweep_time_ball > 0.0f && sweep_time_ball < (cue_llpos - lpos2).magnitude )
+			if( bArmed )
 			{
-				lpos2 = cue_llpos + cue_vdir * sweep_time_ball;
-			}
+				float sweep_time_ball = Vector2.Dot( ball_positions[0] - cue_llpos, cue_vdir );
 
-			// Hit condition is when cuetip is gone inside ball
-			if( (lpos2 - ball_positions[0]).sqrMagnitude < BALL_RSQR )
-			{
-				devhit.SetActive( false );
-				guideline.SetActive( false );
+				// Check for potential skips due to low frame rate
+				if( sweep_time_ball > 0.0f && sweep_time_ball < (cue_llpos - lpos2).magnitude )
+				{
+					lpos2 = cue_llpos + cue_vdir * sweep_time_ball;
+				}
 
-				// Compute velocity delta
-				float vel = (lpos2 - cue_llpos).magnitude * 10.0f;
+				// Hit condition is when cuetip is gone inside ball
+				if( (lpos2 - ball_positions[0]).sqrMagnitude < BALL_RSQR )
+				{
+					devhit.SetActive( false );
+					guideline.SetActive( false );
 
-				// weeeeeeee
-				ball_velocities[0] = cue_vdir * Mathf.Min( vel, 1.0f ) * 14.0f;
+					// Compute velocity delta
+					float vel = (lpos2 - cue_llpos).magnitude * 10.0f;
 
-				bArmed = false;
+					// weeeeeeee
+					ball_velocities[0] = cue_vdir * Mathf.Min( vel, 1.0f ) * 14.0f;
 
-				// Commit changes
-				sn_simulating = true;
-				NetPack();
-			}
-		}
-		else
-		{
-			cue_vdir = new Vector2( cuetip.transform.forward.z, -cuetip.transform.forward.x ).normalized;
+					// Remove locks
+					bArmed = false;
+					sn_permit = false;
 
-			// Get where the cue will strike the ball
-			if( RayCircle( lpos2, cue_vdir, ball_positions[0] ))
-			{
-				guideline.SetActive( true );
-				devhit.SetActive( true );
-				devhit.transform.position = new Vector3( RayCircle_output.x, 0.0f, RayCircle_output.y );
+					FRP( FRP_LOW + "Commiting changes" + FRP_END );
 
-				Vector2 scuffdir = ( ball_positions[0] - RayCircle_output ).normalized * 0.5f;
-
-				cue_vdir += scuffdir;
-				cue_vdir = cue_vdir.normalized;
-
-				// TODO: add scuff offset to vdir
-				cue_fdir = Mathf.Atan2( cue_vdir.y, cue_vdir.x );
-
-				// Update the prediction line direction
-				guideline.transform.eulerAngles = new Vector3( 0.0f, -cue_fdir * Mathf.Rad2Deg, 0.0f );
+					// Commit changes
+					sn_simulating = true;
+					NetPack( sn_turnid );
+					NetRead();
+				}
 			}
 			else
 			{
-				devhit.SetActive( false );
-				guideline.SetActive( false );
+				cue_vdir = new Vector2( cuetip.transform.forward.z, -cuetip.transform.forward.x ).normalized;
+
+				// Get where the cue will strike the ball
+				if( RayCircle( lpos2, cue_vdir, ball_positions[0] ))
+				{
+					guideline.SetActive( true );
+					devhit.SetActive( true );
+					devhit.transform.position = new Vector3( RayCircle_output.x, 0.0f, RayCircle_output.y );
+
+					Vector2 scuffdir = ( ball_positions[0] - RayCircle_output ).normalized * 0.5f;
+
+					cue_vdir += scuffdir;
+					cue_vdir = cue_vdir.normalized;
+
+					// TODO: add scuff offset to vdir
+					cue_fdir = Mathf.Atan2( cue_vdir.y, cue_vdir.x );
+
+					// Update the prediction line direction
+					guideline.transform.eulerAngles = new Vector3( 0.0f, -cue_fdir * Mathf.Rad2Deg, 0.0f );
+				}
+				else
+				{
+					devhit.SetActive( false );
+					guideline.SetActive( false );
+				}
 			}
 		}
 
@@ -486,7 +586,7 @@ public class ht8b : UdonSharpBehaviour
 
 	private void Start()
 	{
-		FRP( "Starting" );
+		FRP( FRP_LOW + "Starting" + FRP_END );
 
 		aud_click = this.GetComponent<AudioSource>();
 
@@ -499,13 +599,17 @@ public class ht8b : UdonSharpBehaviour
 
 		SetupBreak();
 
-		NetPack();
+		NetPack( 0 );
 		NetRead();
 	}
 
+	// Resets local game state to defined state
 	public void SetupBreak()
 	{
+		FRP( FRP_LOW + "SetupBreak()" + FRP_END );
+
 		sn_pocketed = 0x00;
+		sn_simulating = false;
 
 		for( int i = 0; i < 16; i ++ )
 		{
@@ -522,8 +626,31 @@ public class ht8b : UdonSharpBehaviour
 		SetupBreak();
 
 		// Re-encode positions
-		NetPack();
+		NetPack( 0 );
 		NetRead();
+	}
+
+	public void NewGame()
+	{
+		FRP( FRP_LOW + "(local) NewGame()" + FRP_END );
+
+		if( Networking.GetOwner( playerTotems[0] ) == Networking.LocalPlayer )
+		{
+			FRP( FRP_YES + "Starting new game" + FRP_END );
+			
+			Networking.SetOwner( Networking.LocalPlayer, this.gameObject );
+
+			SetupBreak();
+			NewTurn();
+
+			// TODO: send which totem ID started the game instead
+			NetPack( 0 );
+			NetRead();
+		}
+		else
+		{
+			FRP( FRP_ERR + "Permission denied, you are not player 0" + FRP_END );
+		}
 	}
 
 	// REGION NETWORKING
@@ -567,7 +694,7 @@ public class ht8b : UdonSharpBehaviour
 	} 
 	 
 	// Encode all data of game state into netstr
-	public void NetPack()
+	public void NetPack( uint _turnid )
 	{
 		string enc = "";
 
@@ -586,20 +713,27 @@ public class ht8b : UdonSharpBehaviour
 		// Encode pocketed imformation
 		enc += EncodeUint16( (ushort)(sn_pocketed & 0x0000FFFFU) );
 
-		// Game state. TODO: put other stuff here
-		enc += EncodeUint16( sn_simulating? (ushort)0x1U : (ushort)0x0U );
+		// Game state
+		uint flags = 0x0U;
+		if( sn_simulating ) flags |= 0x1U;
+		flags |= _turnid << 1;
+		if( sn_foul ) flags |= 0x4U;
+
+		enc += EncodeUint16( (ushort)flags );
 
 		netstr = enc;
 
-		FRP( "NetPack()" );
+		FRP( FRP_LOW + "NetPack()" + FRP_END );
 	}
 
 	// Decode networking string
 	public void NetRead()
 	{
+		FRP( FRP_LOW + netstr_hex() + FRP_END );
+
 		if( netstr.Length < 18 * 4 )
 		{
-			FRP( "Sync string too short for decode, skipping\n" );
+			FRP( FRP_WARN + "Sync string too short for decode, skipping\n" + FRP_END );
 			return;
 		}
 
@@ -617,10 +751,45 @@ public class ht8b : UdonSharpBehaviour
 		sn_pocketed = DecodeUint16( arr, 17 * 4 );
 
 		// Game state
-		uint gamestate = DecodeUint16( arr, 17 * 4 + 1 );
+		uint gamestate = DecodeUint16( arr, 17 * 4 + 2 );
 		sn_simulating = (gamestate & 0x1U) == 0x1U;
+		sn_foul = (gamestate & 0x4U) == 0x4U;
 
-		FRP( "S " + netstr_hex() );
+		uint newturn = (gamestate & 0x2U) >> 1;
+		if( sn_turnid != newturn )
+		{
+			FRP( FRP_LOW + "Ownership changed" + FRP_END );
+
+			sn_turnid = newturn;
+
+			// Fullfil ownership transfer
+			if( Networking.GetOwner( playerTotems[ sn_turnid ] ) == Networking.LocalPlayer )
+			{
+				FRP( FRP_YES + "Transfered to local" + FRP_END );
+
+				if( sn_simulating )
+				{
+					// In THEORY this should never ever be hit, but there might be an edge case
+					FRP( FRP_ERR + "Remote still simulating when ownership transfer attempt was made... script is deadlocked! contact harry!" + FRP_END );
+				}
+				else
+				{
+					// Give our local player permission to play his turn
+					Networking.SetOwner(Networking.LocalPlayer, this.gameObject);
+					
+					// Sort out gamestate
+					NewTurn();
+					
+					// Not sure why these were called ?
+					// NetPack( sn_turnid );
+					// NetRead();
+				}
+			}
+			else
+			{
+				FRP( FRP_LOW + "Transfered to remote" + FRP_END );
+			}
+		}
 	}
 
 	string netstr_hex()
@@ -642,7 +811,7 @@ public class ht8b : UdonSharpBehaviour
 	{
 		if( !string.Equals( netstr, netstr_prv ) )
 		{
-			FRP( "OnDeserialization() :: netstr update" );
+			FRP( FRP_LOW + "OnDeserialization() :: netstr update" + FRP_END );
 
 			netstr_prv = netstr;
 
@@ -650,7 +819,7 @@ public class ht8b : UdonSharpBehaviour
 			// are settled by the client
 			if( sn_simulating )
 			{
-				FRP( "local simulation is still running, the network update will occur after completion" );
+				FRP( FRP_WARN + "local simulation is still running, the network update will occur after completion" + FRP_END );
 				sn_updatelock = true;
 			}
 			else
@@ -694,6 +863,8 @@ public class ht8b : UdonSharpBehaviour
 		output += sn_simulating ?
 			"<color=\"#95a2b8\">sim(</color> <color=\"#4287F5\">ACTIVE</color> <color=\"#95a2b8\">)</color> ":
 			"<color=\"#95a2b8\">sim(</color> <color=\"#678AC2\">PAUSED</color> <color=\"#95a2b8\">)</color> ";
+
+		output += "<color=\"#95a2b8\">player(</color> <color=\"#4287F5\">"+ Networking.GetOwner(playerTotems[sn_turnid]).displayName + ":" + sn_turnid + "</color> <color=\"#95a2b8\">)</color>";
 
 		output += "\n---------------------------------------------------------------------------------------------------------------------------------------------------------\n";
 
