@@ -1,4 +1,9 @@
 ﻿//#define USE_FIXED_POINT
+//#define NPACK_8BIT
+#define NPACK_16BIT 
+
+
+
 
 using UdonSharp;
 using UnityEngine;
@@ -9,7 +14,21 @@ using System;
 
 public class ht8b : UdonSharpBehaviour
 {
-	[UdonSynced]
+	#if NPACK_16BIT
+
+		const int NPACK_SHORT_WIDTH = 1;
+		const int NPACK_VEC2_WIDTH = 2;
+  
+	#endif
+
+	#if NPACK_8BIT
+
+		const int NPACK_SHORT_WIDTH = 2;
+		const int NPACK_VEC2_WIDTH = 4;
+
+	#endif
+
+	  [UdonSynced]
 	private string netstr; // dumpster fire
 	private string netstr_prv;
 
@@ -52,8 +71,28 @@ public class ht8b : UdonSharpBehaviour
 	public int	sn_firsthit = 0;        // The first ball to be hit by cue ball
 	public bool sn_foul = false;        // End-of-turn foul marker
 	public bool sn_gameover = false;    // Game is complete
-	public uint sn_winnerid = 0x00U;		// Who won the game if sn_gameover is set
-	
+	public uint sn_winnerid = 0x00U;    // Who won the game if sn_gameover is set
+
+	/* Networking layout [ushorts]
+	 *  Total size: 72 bytes over network
+	 * 
+	 *  Bytes		What						Data type
+	 * 
+	 *  [ 0-31  ]: ball positions			(compressed quantized floats)
+	 *  [ 32-33 ]: cue ball velocity		^
+	 *  
+	 *  [ 34-35 ]: game state flags		| bit #	| mask	| what				| 
+	 *												| 0		| 0x1		| sn_simulating	|
+	 *												| 1		| 0x2		| sn_turnid			|
+	 *												| 2		| 0x4		| sn_foul			|
+	 *												| 3		| 0x8		| sn_open			|
+	 *												| 4		| 0x10	| sn_playerxor		|
+	 *												| 5		| 0x20	| sn_gameover		|
+	 *												| 6		| 0x40	| sn_winnerid		|
+	 *												
+	 *	[ 35-36 ]:
+	 */
+
 	// REGION PHYSICS ENGINE
 	// =========================================================================================================================
 
@@ -278,7 +317,10 @@ public class ht8b : UdonSharpBehaviour
 					ball_velocities[i] += reflection;
 
 					//aud_click.volume = Mathf.Clamp( ball_velocities[id].sqrMagnitude * 0.2f, 0.0f, 1.0f ); 
-					aud_click.Play();
+					
+					// Prevent sound spam if it happens
+					if( ball_velocities[id].sqrMagnitude > 0 )
+						aud_click.Play();
 
 					// First hit detected
 					if( id == 0 && sn_firsthit == 0 )
@@ -380,6 +422,11 @@ public class ht8b : UdonSharpBehaviour
 		FRP( FRP_YES + "Winner of match: " + Networking.GetOwner( playerTotems[sn_winnerid] ).displayName + FRP_END );
 	}
 
+	void OnTurnChangeLocal()
+	{
+
+	}
+
 	void SimEnd()
 	{
 		sn_simulating = false;
@@ -455,6 +502,8 @@ public class ht8b : UdonSharpBehaviour
 				// Flip player bit and commit, reciever will take ownership once update propogates
 				FRP( FRP_LOW + "Transferring ownership" + FRP_END );
 
+				OnTurnChangeLocal();
+
 				NetPack( sn_turnid ^ 0x1U );
 				NetRead();
 			}
@@ -525,6 +574,8 @@ public class ht8b : UdonSharpBehaviour
 				if( oppturn )
 				{
 					FRP( FRP_LOW + "Turn will not be extended, transferring ownership" + FRP_END );
+
+					OnTurnChangeLocal();
 
 					NetPack(sn_turnid ^ 0x1U);
 					NetRead();
@@ -794,10 +845,14 @@ public class ht8b : UdonSharpBehaviour
 	// 2 char string from unsigned short
 	string EncodeUint16( ushort sh )
 	{
-		string enc = "";
-		enc += (char)(((uint)sh) & 0xFF);
-		enc += (char)(((uint)sh >> 8) & 0xFF);
-		return enc;
+		#if NPACK_16BIT
+		 return "" + (char)sh;
+		#else
+		 string enc = "";
+		 enc += (char)(((uint)sh) & 0xFF);
+		 enc += (char)(((uint)sh >> 8) & 0xFF);
+		 return enc;
+		#endif
 	}
 
 	// 4 char string from Vector2. Encodes floats in: [ -range, range ] to 0-65535
@@ -812,17 +867,22 @@ public class ht8b : UdonSharpBehaviour
 	// 2 chars at index to ushort
 	ushort DecodeUint16( char[] arr, int start )
 	{
-		ushort dec = 0x00;
-		dec |= (ushort)((arr[start + 0]) & 0x00FF);
-		dec |= (ushort)(((uint)(arr[start + 1]) << 8) & 0xFF00);
-		return dec; 
+		#if NPACK_16BIT
+		 return (ushort)arr[start];
+		#else
+		 ushort dec = 0x00;
+		 dec |= (ushort)((arr[start + 0]) & 0x00FF);
+		 dec |= (ushort)(((uint)(arr[start + 1]) << 8) & 0xFF00);
+		 return dec; 
+		#endif
 	}
 
 	// Decode 4 chars at index to Vector2. Decodes from 0-65535 to [ -range, range ]
 	Vector2 Decodev2( char[] arr, int start, float range )
 	{
 		float x = (((float)DecodeUint16(arr, start) - I16_MAXf) / I16_MAXf) * range;
-		float y = (((float)DecodeUint16(arr, start + 2) - I16_MAXf) / I16_MAXf) * range;
+		float y = (((float)DecodeUint16(arr, start + NPACK_SHORT_WIDTH) - I16_MAXf) / I16_MAXf) * range;
+		
 		return new Vector2(x,y);
 	} 
 	 
@@ -837,8 +897,6 @@ public class ht8b : UdonSharpBehaviour
 		{
 			string coded = Encodev2(ball_positions[i], 2.5f);
 			enc += coded;
-
-			Vector2 test = Decodev2(coded.ToCharArray(), 0, 2.5f);
 		}
 
 		// Cue ball velocity last
@@ -860,6 +918,11 @@ public class ht8b : UdonSharpBehaviour
 		enc += EncodeUint16( (ushort)flags );
 		enc += EncodeUint16( sn_packetid );
 
+		for( int i = 0; i < 85; i ++ )
+		{
+			enc += EncodeUint16( 0xBEEF );
+		}
+
 		netstr = enc;
 
 		FRP( FRP_LOW + "NetPack()" + FRP_END );
@@ -870,7 +933,7 @@ public class ht8b : UdonSharpBehaviour
 	{
 		FRP( FRP_LOW + netstr_hex() + FRP_END );
 
-		if( netstr.Length < 18 * 4 )
+		if( netstr.Length < 18 * NPACK_VEC2_WIDTH )
 		{
 			FRP( FRP_WARN + "Sync string too short for decode, skipping\n" + FRP_END );
 			return;
@@ -879,7 +942,7 @@ public class ht8b : UdonSharpBehaviour
 		char[] arr = netstr.ToCharArray();
 		
 		// Throw out updates that are possible errournous
-		ushort nextid = DecodeUint16( arr, 17 * 4 + 4 );
+		ushort nextid = DecodeUint16( arr, 18 * NPACK_VEC2_WIDTH );
 		if( nextid < sn_packetid )
 		{
 			FRP( FRP_WARN + "Packet ID was old ( " + nextid + " < " + sn_packetid + " ). Throwing out update" + FRP_END );
@@ -890,16 +953,16 @@ public class ht8b : UdonSharpBehaviour
 		for( int i = 0; i < 16; i ++ )
 		{
 			ball_velocities[i] = Vector2.zero;
-			ball_positions[i] = Decodev2( arr, i * 4, 2.5f );
+			ball_positions[i] = Decodev2( arr, i * NPACK_VEC2_WIDTH, 2.5f );
 		}
 
-		ball_velocities[0] = Decodev2( arr, 16 * 4, 50.0f );
+		ball_velocities[0] = Decodev2( arr, 16 * NPACK_VEC2_WIDTH, 50.0f );
 
 		// Pocketed information
-		sn_pocketed = DecodeUint16( arr, 17 * 4 );
+		sn_pocketed = DecodeUint16( arr, 17 * NPACK_VEC2_WIDTH );
 
 		// Game state
-		uint gamestate = DecodeUint16( arr, 17 * 4 + 2 );
+		uint gamestate = DecodeUint16( arr, 17 * NPACK_VEC2_WIDTH + NPACK_SHORT_WIDTH );
 		sn_simulating = (gamestate & 0x1U) == 0x1U;
 		sn_foul = (gamestate & 0x4U) == 0x4U;
 		sn_open = (gamestate & 0x8U) == 0x8U;
@@ -940,6 +1003,8 @@ public class ht8b : UdonSharpBehaviour
 			else
 			{
 				FRP( FRP_LOW + "Transfered to remote" + FRP_END );
+
+				OnTurnChangeLocal();
 			}
 		}
 
@@ -956,9 +1021,9 @@ public class ht8b : UdonSharpBehaviour
 		char[] arr = netstr.ToCharArray();
 		string str = "";
 
-		for( int i = 0; i < netstr.Length / 2; i ++ )
+		for( int i = 0; i < netstr.Length / NPACK_SHORT_WIDTH; i ++ )
 		{
-			ushort v = DecodeUint16( arr, i * 2 );
+			ushort v = DecodeUint16( arr, i * NPACK_SHORT_WIDTH );
 			str += v.ToString("X4");
 		}
 
@@ -1012,7 +1077,7 @@ public class ht8b : UdonSharpBehaviour
 			FRP_LEN = FRP_MAX;
 		}
 
-		string output = "ht8b 0.0.3a ";
+		string output = "ht8b 0.0.4a ";
 		
 		// Add information about game state:
 		output += Networking.IsOwner(Networking.LocalPlayer, this.gameObject) ? 
