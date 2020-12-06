@@ -50,7 +50,9 @@ public class ht8b : UdonSharpBehaviour
 	public uint	sn_turnid = 0x00U;		// Whos turn is it, 0 or 1
 	public bool	sn_permit = false;		// Permission for local player to play
 	public int	sn_firsthit = 0;        // The first ball to be hit by cue ball
-	public bool sn_foul = false;			// End-of-turn foul marker
+	public bool sn_foul = false;        // End-of-turn foul marker
+	public bool sn_gameover = false;    // Game is complete
+	public uint sn_winnerid = 0x00U;		// Who won the game if sn_gameover is set
 	
 	// REGION PHYSICS ENGINE
 	// =========================================================================================================================
@@ -373,6 +375,11 @@ public class ht8b : UdonSharpBehaviour
 		
 	}
 
+	void GameOverLocal()
+	{
+		FRP( FRP_YES + "Winner of match: " + Networking.GetOwner( playerTotems[sn_winnerid] ).displayName + FRP_END );
+	}
+
 	void SimEnd()
 	{
 		sn_simulating = false;
@@ -397,15 +404,31 @@ public class ht8b : UdonSharpBehaviour
 				if(((sn_pocketed & bmask) != bmask && (sn_pocketed & 0x2U) == 0x2U))
 				{
 					FRP( FRP_ERR + "LOSS: sunk white and black" + FRP_END );
+
+					sn_gameover = true;
+					sn_winnerid = sn_turnid ^ 0x1U;
+
+					GameOverLocal();
+
+					NetPack( sn_turnid );
+					NetRead();
+
+					return;
 				}
 			}
 			else if( (sn_pocketed & bmask) != bmask && (sn_pocketed & 0x2U) == 0x2U )
 			{
 				FRP( FRP_ERR + "LOSS: potted 8 ball before completing set" + FRP_END );
-				sn_foul = true;
 
-				// Not sure what do to with this bit yet
-				// TODO
+				sn_gameover = true;
+				sn_winnerid = sn_turnid ^ 0x1U;
+
+				GameOverLocal();
+
+				NetPack( sn_turnid );
+				NetRead();
+
+				return;
 			}
 			else
 			{
@@ -480,7 +503,16 @@ public class ht8b : UdonSharpBehaviour
 						if((sn_pocketed & bmask) == bmask && (sn_pocketed & 0x2U) == 0x2U)
 						{
 							FRP( FRP_YES + "(local) Player wins!" + FRP_END );
-							// TODO: winning thing
+
+							sn_gameover = true;
+							sn_winnerid = sn_turnid;
+
+							GameOverLocal();
+
+							NetPack( sn_turnid );
+							NetRead();
+							
+							return;
 						}
 						else
 						{
@@ -704,9 +736,11 @@ public class ht8b : UdonSharpBehaviour
 		sn_pocketed_prv = 0x00;
 		sn_simulating = false;
 		sn_open = true;
+		sn_gameover = false;
 
 		// Doesnt need to be set but for consistencys sake
 		sn_playerxor = 0;
+		sn_winnerid = 0;
 
 		for( int i = 0; i < 16; i ++ )
 		{
@@ -754,6 +788,8 @@ public class ht8b : UdonSharpBehaviour
 	// =========================================================================================================================
 
 	const float I16_MAXf = 32767.0f;
+	ushort sn_packetid = (ushort)0x00U;			// Current packet number, used for locking updates so we dont accidently go back.
+															// this behaviour was observed on some long connections so its necessary
 
 	// 2 char string from unsigned short
 	string EncodeUint16( ushort sh )
@@ -794,6 +830,7 @@ public class ht8b : UdonSharpBehaviour
 	public void NetPack( uint _turnid )
 	{
 		string enc = "";
+		sn_packetid ++;
 
 		// positions
 		for ( int i = 0; i < 16; i ++ )
@@ -817,8 +854,11 @@ public class ht8b : UdonSharpBehaviour
 		if( sn_foul ) flags |= 0x4U;
 		if( sn_open ) flags |= 0x8U;
 		flags |= sn_playerxor << 4;
+		if( sn_gameover ) flags |= 0x20U;
+		flags |= sn_winnerid << 6;
 
 		enc += EncodeUint16( (ushort)flags );
+		enc += EncodeUint16( sn_packetid );
 
 		netstr = enc;
 
@@ -837,6 +877,15 @@ public class ht8b : UdonSharpBehaviour
 		}
 
 		char[] arr = netstr.ToCharArray();
+		
+		// Throw out updates that are possible errournous
+		ushort nextid = DecodeUint16( arr, 17 * 4 + 4 );
+		if( nextid < sn_packetid )
+		{
+			FRP( FRP_WARN + "Packet ID was old ( " + nextid + " < " + sn_packetid + " ). Throwing out update" + FRP_END );
+			return;
+		}
+		sn_packetid = nextid;
 
 		for( int i = 0; i < 16; i ++ )
 		{
@@ -855,7 +904,9 @@ public class ht8b : UdonSharpBehaviour
 		sn_foul = (gamestate & 0x4U) == 0x4U;
 		sn_open = (gamestate & 0x8U) == 0x8U;
 		sn_playerxor = (gamestate & 0x10U) >> 4;
+		sn_winnerid = (gamestate & 0x20U) >> 5;
 
+		// Check if turn was transferred
 		uint newturn = (gamestate & 0x2U) >> 1;
 		if( sn_turnid != newturn )
 		{
@@ -890,6 +941,13 @@ public class ht8b : UdonSharpBehaviour
 			{
 				FRP( FRP_LOW + "Transfered to remote" + FRP_END );
 			}
+		}
+
+		// Check if game is over
+		bool gameover = (gamestate & 0x40U) == 0x40U;
+		if (gameover && !sn_gameover)
+		{
+			GameOverLocal();
 		}
 	}
 
