@@ -68,6 +68,18 @@ public class ht8b : UdonSharpBehaviour
 	public GameObject gametable;
 	Renderer tableRenderer;
 
+	// Components
+	AudioSource aud_main;
+
+	[SerializeField]
+	public AudioClip snd_Intro;
+	[SerializeField]
+	public AudioClip snd_Sink;
+	[SerializeField]
+	public AudioClip[] snd_Hits;
+	[SerializeField]
+	public AudioClip snd_NewTurn;
+
 	// REGION GAME STATE
 	// =========================================================================================================================
 	public bool	sn_simulating = false;	// True whilst balls are rolling
@@ -90,6 +102,8 @@ public class ht8b : UdonSharpBehaviour
 	ushort		sn_gameid = 0;				// Game number
 	byte			sn_wins0 = 0;				// Wins for player 0 (unused)
 	byte			sn_wins1 = 0;				// Wins for player 1 (unused)
+
+	float			introAminTimer = 0.0f;	// Ball dropper timer
 
 	/* Networking layout [ushorts]
 	 *  Total size: 72 bytes over network
@@ -164,16 +178,23 @@ public class ht8b : UdonSharpBehaviour
 		FRP( FRP_YES + "(local) turn switch to: " + Networking.GetOwner( playerTotems[sn_turnid] ).displayName + FRP_END );
 
 		UpdateTableColor( sn_turnid );
+
+		aud_main.PlayOneShot( snd_NewTurn, 1.0f );
 	}
 
 	void OnPocketGood()
 	{
+		// Make a bright flash
 		tableCurrentColour *= 1.9f;
+
+		aud_main.PlayOneShot( snd_Sink, 1.0f );
 	}
 
 	void OnPocketBad()
 	{
 		tableCurrentColour = tableColourRed;
+
+		aud_main.PlayOneShot( snd_Sink, 1.0f );
 	}
 
 	void NewGameLocal()
@@ -183,6 +204,9 @@ public class ht8b : UdonSharpBehaviour
 
 		// Set table colour to grey
 		tableSrcColour = tableColorWhite;
+
+		introAminTimer = 2.0f;
+		aud_main.PlayOneShot( snd_Intro, 1.0f );
 	}
 
 	// REGION PHYSICS ENGINE
@@ -215,9 +239,6 @@ public class ht8b : UdonSharpBehaviour
 	public Vector2[]	ball_positions = new Vector2[16];
 	Vector2[]			ball_originals = new Vector2[16];
 	public Vector2[] ball_velocities = new Vector2[16];
-
-	// Components
-	AudioSource aud_click;
 
 	void ClampBallVelSemi( int id, Vector2 surface )
 	{
@@ -418,7 +439,7 @@ public class ht8b : UdonSharpBehaviour
 					
 					// Prevent sound spam if it happens
 					if( ball_velocities[id].sqrMagnitude > 0 )
-						aud_click.Play();
+						aud_main.PlayOneShot( snd_Hits[ 0 ], 1.0f );
 
 					// First hit detected
 					if( id == 0 && sn_firsthit == 0 )
@@ -601,7 +622,7 @@ public class ht8b : UdonSharpBehaviour
 					{
 						// Player triggered turn xor
 						// check which group has the most sinks and 
-						if((sn_pocketed & 0x1FC) > (sn_pocketed & 0xFE00))
+						if((sn_pocketed & 0x1FC) > ((sn_pocketed & 0xFE00) >> 7))
 						{
 							sn_playerxor = sn_turnid;
 							// FRP( FRP_YES + "(local) Player is oranges!" + FRP_END );
@@ -615,6 +636,10 @@ public class ht8b : UdonSharpBehaviour
 						sn_open = false;
 
 						DisplaySetLocal();
+
+						// Update needs to be sent about playerxor etc
+						NetPack( sn_turnid );
+						NetRead();
 					}
 					else
 					{
@@ -849,14 +874,49 @@ public class ht8b : UdonSharpBehaviour
 		}
 
 		tableRenderer.sharedMaterial.SetColor("_EmissionColor", tableCurrentColour);
+
+		if( introAminTimer > 0.0f )
+		{
+			introAminTimer -= Time.deltaTime;
+
+			Vector3 temp;
+			float atime;
+			float aitime;
+
+			if( introAminTimer < 0.0f )
+				introAminTimer = 0.0f;
+
+			// Cueball drops late
+			temp = balls_render[0].transform.position;
+			atime = Mathf.Clamp(introAminTimer - 0.33f, 0.0f, 1.0f); 
+			aitime = (1.0f - atime) * 0.06f;
+			temp.y = Mathf.Abs(Mathf.Cos(atime * 6.29f)) * atime * 0.5f;
+			balls_render[0].transform.position = temp;
+			balls_render[0].transform.localScale = new Vector3(aitime, aitime, aitime);
+
+			for ( int i = 1; i < 16; i ++ )
+			{
+				temp = balls_render[i].transform.position;
+				atime = Mathf.Clamp(introAminTimer - 0.84f - (float)i * 0.03f, 0.0f, 1.0f);
+				aitime = (1.0f - atime) * 0.06f;
+
+				temp.y = Mathf.Abs( Mathf.Cos( atime * 6.29f ) ) * atime * 0.5f;
+				balls_render[i].transform.position = temp;
+				balls_render[i].transform.localScale = new Vector3(aitime, aitime, aitime);
+			}
+		}
 	}
 
 	private void Start()
 	{
 		FRP( FRP_LOW + "Starting" + FRP_END );
 
-		aud_click = this.GetComponent<AudioSource>();
+		aud_main = this.GetComponent<AudioSource>();
 		tableRenderer = gametable.GetComponent<Renderer>();
+
+		// turn off guideline
+		guideline.SetActive( false );
+		devhit.SetActive( false );
 
 		// randomize positions and velocities
 		for( int i = 0; i < 16; i ++ ) 
@@ -1066,7 +1126,7 @@ public class ht8b : UdonSharpBehaviour
 		sn_simulating = (gamestate & 0x1U) == 0x1U;
 		sn_foul = (gamestate & 0x4U) == 0x4U;
 		sn_playerxor = (gamestate & 0x10U) >> 4;
-		sn_winnerid = (gamestate & 0x20U) >> 5;
+		sn_winnerid = (gamestate & 0x40U) >> 6;
 
 		bool openlast = sn_open; 
 		sn_open = (gamestate & 0x8U) == 0x8U;
@@ -1110,17 +1170,18 @@ public class ht8b : UdonSharpBehaviour
 			OnTurnChangeLocal();
 		}
 
-		if(!openlast && sn_open)
+		if(openlast && !sn_open)
 		{
 			DisplaySetLocal();
 		}
 
 		// Check if game is over
-		bool gameover = (gamestate & 0x40U) == 0x40U;
+		bool gameover = (gamestate & 0x20U) == 0x20U;
 		if (gameover && !sn_gameover)
 		{
 			GameOverLocal();
 		}
+		sn_gameover = gameover;
 	}
 
 	string netstr_hex()
