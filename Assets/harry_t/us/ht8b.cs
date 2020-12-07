@@ -2,9 +2,6 @@
 //#define NPACK_8BIT
 #define NPACK_16BIT 
 
-
-
-
 using UdonSharp;
 using UnityEngine;
 using UnityEngine.UI;
@@ -14,6 +11,11 @@ using System;
 
 public class ht8b : UdonSharpBehaviour
 {
+	// Width of packed objects in # chars
+	// c# uses wchar by default so, ushort == char for our purposes
+	// if it somehow causes errors in networking, NPACK_8BIT can
+	// be defined to switch back to 1char/byte networking
+
 	#if NPACK_16BIT
 
 		const int NPACK_SHORT_WIDTH = 1;
@@ -28,7 +30,13 @@ public class ht8b : UdonSharpBehaviour
 
 	#endif
 
-	  [UdonSynced]
+	const string FRP_LOW =	"<color=\"#ADADAD\">";
+	const string FRP_ERR =	"<color=\"#B84139\">";
+	const string FRP_WARN = "<color=\"#DEC521\">";
+	const string FRP_YES =	"<color=\"#69D128\">";
+	const string FRP_END =	"</color>";
+
+	[UdonSynced]
 	private string netstr; // dumpster fire
 	private string netstr_prv;
 
@@ -56,6 +64,10 @@ public class ht8b : UdonSharpBehaviour
 	[SerializeField]
 	public GameObject[] playerTotems;
 
+	[SerializeField]
+	public GameObject gametable;
+	Renderer tableRenderer;
+
 	// REGION GAME STATE
 	// =========================================================================================================================
 	public bool	sn_simulating = false;	// True whilst balls are rolling
@@ -73,15 +85,21 @@ public class ht8b : UdonSharpBehaviour
 	public bool sn_gameover = false;    // Game is complete
 	public uint sn_winnerid = 0x00U;    // Who won the game if sn_gameover is set
 
+	ushort		sn_packetid = 0;			// Current packet number, used for locking updates so we dont accidently go back.
+													// this behaviour was observed on some long connections so its necessary
+	ushort		sn_gameid = 0;				// Game number
+	byte			sn_wins0 = 0;				// Wins for player 0 (unused)
+	byte			sn_wins1 = 0;				// Wins for player 1 (unused)
+
 	/* Networking layout [ushorts]
 	 *  Total size: 72 bytes over network
 	 * 
 	 *  Bytes		What						Data type
 	 * 
-	 *  [ 0-31  ]: ball positions			(compressed quantized floats)
-	 *  [ 32-33 ]: cue ball velocity		^
+	 *  [ 0-15  ]: ball positions			(compressed quantized floats)
+	 *  [ 16-17 ]: cue ball velocity		^
 	 *  
-	 *  [ 34-35 ]: game state flags		| bit #	| mask	| what				| 
+	 *  [ 18    ]: game state flags		| bit #	| mask	| what				| 
 	 *												| 0		| 0x1		| sn_simulating	|
 	 *												| 1		| 0x2		| sn_turnid			|
 	 *												| 2		| 0x4		| sn_foul			|
@@ -90,8 +108,82 @@ public class ht8b : UdonSharpBehaviour
 	 *												| 5		| 0x20	| sn_gameover		|
 	 *												| 6		| 0x40	| sn_winnerid		|
 	 *												
-	 *	[ 35-36 ]:
-	 */
+	 *	[ 19    ]: packet #					uint16
+	 *	[ 20    ]: gameid						uint16
+	 *	
+	*/
+
+	// General local aesthetic events
+	// =========================================================================================================================
+	
+	Color tableSrcColour = new Color( 1.0f, 1.0f, 1.0f, 1.0f );
+
+	Color tableColourBlue = new Color( 0.0f, 0.9f, 1.6f, 1.0f );
+	Color tableColourOrange = new Color( 1.6f, 0.7f, 0.0f, 1.0f );
+	Color tableColourRed = new Color( 1.2f, 0.0f, 0.0f, 1.0f );
+	Color tableColorWhite = new Color( 1.0f, 1.0f, 1.0f, 1.0f );
+
+	Color tableCurrentColour = new Color(1.0f, 1.0f, 1.0f, 1.0f);
+
+	void UpdateTableColor( uint idsrc )
+	{
+		if( !sn_open )
+		{
+			if( (idsrc ^ sn_playerxor) == 1 )
+			{
+				// Set table colour to blue
+				tableSrcColour = tableColourBlue;
+				//tableRenderer.sharedMaterial.SetColor("_EmissionColor", tableSrcColour);
+			}
+			else
+			{
+				// Table colour to orange
+				tableSrcColour = tableColourOrange;
+				//tableRenderer.sharedMaterial.SetColor("_EmissionColor", tableSrcColour);
+			}
+		}
+	}
+
+	void DisplaySetLocal()
+	{
+		FRP( FRP_YES + "(local) " + Networking.GetOwner( playerTotems[sn_turnid] ).displayName + ":" + sn_turnid + " is " + 
+			((sn_turnid ^ sn_playerxor) == 1? "blues": "oranges") + FRP_END );
+
+		UpdateTableColor( sn_turnid );
+	}
+
+	void GameOverLocal()
+	{
+		FRP( FRP_YES + "(local) Winner of match: " + Networking.GetOwner( playerTotems[sn_winnerid] ).displayName + FRP_END );
+
+		UpdateTableColor( sn_winnerid );
+	}
+
+	void OnTurnChangeLocal()
+	{
+		FRP( FRP_YES + "(local) turn switch to: " + Networking.GetOwner( playerTotems[sn_turnid] ).displayName + FRP_END );
+
+		UpdateTableColor( sn_turnid );
+	}
+
+	void OnPocketGood()
+	{
+		tableCurrentColour *= 1.9f;
+	}
+
+	void OnPocketBad()
+	{
+		tableCurrentColour = tableColourRed;
+	}
+
+	void NewGameLocal()
+	{
+		VRCPlayerApi startPlayer = Networking.GetOwner(playerTotems[0]);
+		FRP( FRP_YES + "(local) " + ( startPlayer != null? startPlayer.displayName: "[null]" ) + " started a new game" + FRP_END );
+
+		// Set table colour to grey
+		tableSrcColour = tableColorWhite;
+	}
 
 	// REGION PHYSICS ENGINE
 	// =========================================================================================================================
@@ -127,16 +219,9 @@ public class ht8b : UdonSharpBehaviour
 	// Components
 	AudioSource aud_click;
 
-	const string FRP_LOW =	"<color=\"#ADADAD\">";
-	const string FRP_ERR =	"<color=\"#B84139\">";
-	const string FRP_WARN = "<color=\"#DEC521\">";
-	const string FRP_YES =	"<color=\"#69D128\">";
-	const string FRP_END =	"</color>";
-
 	void ClampBallVelSemi( int id, Vector2 surface )
 	{
 		// TODO: improve this method to be a bit more accurate
-
 		if( Vector2.Dot( ball_velocities[id], surface ) < 0.0f )
 		{
 			ball_velocities[id] = ball_velocities[id].magnitude * surface;
@@ -159,6 +244,19 @@ public class ht8b : UdonSharpBehaviour
 		ball_positions[ id ].y = TABLE_HEIGHT + BALL_DIAMETRE * 2.0f;
 
 		sn_pocketed ^= 1U << id;
+
+		uint bmask = 0x1FCU << ((int)(sn_turnid ^ sn_playerxor) * 7);
+
+		// Good pocket
+		if( ((0x1U << id) & ((bmask) | (sn_open ? 0xFFFCU: 0x0000U) | ((bmask & sn_pocketed) == bmask? 0x2U: 0x0U))) > 0 )
+		{
+			OnPocketGood();
+		}
+		else
+		{
+			// bad
+			OnPocketBad();
+		}
 	}
 
 	// TODO: Inline
@@ -411,22 +509,6 @@ public class ht8b : UdonSharpBehaviour
 		sn_firsthit = 0;
 	}
 
-	// Show player what set of balls he is
-	void DisplaySetLocal()
-	{
-		
-	}
-
-	void GameOverLocal()
-	{
-		FRP( FRP_YES + "Winner of match: " + Networking.GetOwner( playerTotems[sn_winnerid] ).displayName + FRP_END );
-	}
-
-	void OnTurnChangeLocal()
-	{
-
-	}
-
 	void SimEnd()
 	{
 		sn_simulating = false;
@@ -502,8 +584,6 @@ public class ht8b : UdonSharpBehaviour
 				// Flip player bit and commit, reciever will take ownership once update propogates
 				FRP( FRP_LOW + "Transferring ownership" + FRP_END );
 
-				OnTurnChangeLocal();
-
 				NetPack( sn_turnid ^ 0x1U );
 				NetRead();
 			}
@@ -524,16 +604,17 @@ public class ht8b : UdonSharpBehaviour
 						if((sn_pocketed & 0x1FC) > (sn_pocketed & 0xFE00))
 						{
 							sn_playerxor = sn_turnid;
-							FRP( FRP_YES + "(local) Player is oranges!" + FRP_END );
+							// FRP( FRP_YES + "(local) Player is oranges!" + FRP_END );
 						}
 						else
 						{
 							sn_playerxor = sn_turnid ^ 0x1u;
-							FRP( FRP_YES + "(local) Player is blues!" + FRP_END );
+							// FRP( FRP_YES + "(local) Player is blues!" + FRP_END );
 						}
 
-						DisplaySetLocal();
 						sn_open = false;
+
+						DisplaySetLocal();
 					}
 					else
 					{
@@ -574,8 +655,6 @@ public class ht8b : UdonSharpBehaviour
 				if( oppturn )
 				{
 					FRP( FRP_LOW + "Turn will not be extended, transferring ownership" + FRP_END );
-
-					OnTurnChangeLocal();
 
 					NetPack(sn_turnid ^ 0x1U);
 					NetRead();
@@ -652,7 +731,7 @@ public class ht8b : UdonSharpBehaviour
 	private void Update()
 	{
 		// Physics step accumulator routine
-		float time = Time.realtimeSinceStartup;
+		float time = Time.timeSinceLevelLoad;
 		float timeDelta = time - timeLast;
 
 		if ( timeDelta > MAX_DELTA )
@@ -757,6 +836,19 @@ public class ht8b : UdonSharpBehaviour
 		}
 
 		cue_llpos = lpos2;
+
+		// Table outline colour
+		if( sn_gameover )
+		{
+			// Flashing if we won
+			tableCurrentColour = tableSrcColour * (Mathf.Sin( Time.timeSinceLevelLoad * 3.0f) * 0.5f + 1.0f);
+		}
+		else
+		{
+			tableCurrentColour = Color.Lerp( tableCurrentColour, tableSrcColour, Time.deltaTime * 3.0f );
+		}
+
+		tableRenderer.sharedMaterial.SetColor("_EmissionColor", tableCurrentColour);
 	}
 
 	private void Start()
@@ -764,6 +856,7 @@ public class ht8b : UdonSharpBehaviour
 		FRP( FRP_LOW + "Starting" + FRP_END );
 
 		aud_click = this.GetComponent<AudioSource>();
+		tableRenderer = gametable.GetComponent<Renderer>();
 
 		// randomize positions and velocities
 		for( int i = 0; i < 16; i ++ ) 
@@ -779,6 +872,7 @@ public class ht8b : UdonSharpBehaviour
 	}
 
 	// Resets local game state to defined state
+	// TODO: Merge this with NewGame()
 	public void SetupBreak()
 	{
 		FRP( FRP_LOW + "SetupBreak()" + FRP_END );
@@ -799,6 +893,8 @@ public class ht8b : UdonSharpBehaviour
 			ball_velocities[ i ] = Vector2.zero;
 			balls_render[ i ].SetActive( true );
 		}
+
+		NewGameLocal();
 	}
 
 	public void SendDebugImpulse()
@@ -822,6 +918,8 @@ public class ht8b : UdonSharpBehaviour
 			
 			Networking.SetOwner( Networking.LocalPlayer, this.gameObject );
 
+			sn_gameid ++;
+
 			SetupBreak();
 			NewTurn();
 
@@ -839,8 +937,6 @@ public class ht8b : UdonSharpBehaviour
 	// =========================================================================================================================
 
 	const float I16_MAXf = 32767.0f;
-	ushort sn_packetid = (ushort)0x00U;			// Current packet number, used for locking updates so we dont accidently go back.
-															// this behaviour was observed on some long connections so its necessary
 
 	// 2 char string from unsigned short
 	string EncodeUint16( ushort sh )
@@ -917,11 +1013,7 @@ public class ht8b : UdonSharpBehaviour
 
 		enc += EncodeUint16( (ushort)flags );
 		enc += EncodeUint16( sn_packetid );
-
-		for( int i = 0; i < 85; i ++ )
-		{
-			enc += EncodeUint16( 0xBEEF );
-		}
+		enc += EncodeUint16( sn_gameid );
 
 		netstr = enc;
 
@@ -950,6 +1042,14 @@ public class ht8b : UdonSharpBehaviour
 		}
 		sn_packetid = nextid;
 
+		// Check for new game
+		ushort nextgame = DecodeUint16( arr, 18 * NPACK_VEC2_WIDTH + NPACK_SHORT_WIDTH );
+		if( nextgame > sn_gameid )
+		{
+			NewGameLocal();
+		}
+		sn_gameid = nextgame;
+
 		for( int i = 0; i < 16; i ++ )
 		{
 			ball_velocities[i] = Vector2.zero;
@@ -965,9 +1065,11 @@ public class ht8b : UdonSharpBehaviour
 		uint gamestate = DecodeUint16( arr, 17 * NPACK_VEC2_WIDTH + NPACK_SHORT_WIDTH );
 		sn_simulating = (gamestate & 0x1U) == 0x1U;
 		sn_foul = (gamestate & 0x4U) == 0x4U;
-		sn_open = (gamestate & 0x8U) == 0x8U;
 		sn_playerxor = (gamestate & 0x10U) >> 4;
 		sn_winnerid = (gamestate & 0x20U) >> 5;
+
+		bool openlast = sn_open; 
+		sn_open = (gamestate & 0x8U) == 0x8U;
 
 		// Check if turn was transferred
 		uint newturn = (gamestate & 0x2U) >> 1;
@@ -985,7 +1087,7 @@ public class ht8b : UdonSharpBehaviour
 				if( sn_simulating )
 				{
 					// In THEORY this should never ever be hit, but there might be an edge case
-					FRP( FRP_ERR + "Remote still simulating when ownership transfer attempt was made... script is deadlocked! contact harry!" + FRP_END );
+					FRP( FRP_ERR + "Remote simulating when ownership transfer attempt was made... script is deadlocked! contact harry!" + FRP_END );
 				}
 				else
 				{
@@ -1003,9 +1105,14 @@ public class ht8b : UdonSharpBehaviour
 			else
 			{
 				FRP( FRP_LOW + "Transfered to remote" + FRP_END );
-
-				OnTurnChangeLocal();
 			}
+
+			OnTurnChangeLocal();
+		}
+
+		if(!openlast && sn_open)
+		{
+			DisplaySetLocal();
 		}
 
 		// Check if game is over
@@ -1088,7 +1195,8 @@ public class ht8b : UdonSharpBehaviour
 			"<color=\"#95a2b8\">sim(</color> <color=\"#4287F5\">ACTIVE</color> <color=\"#95a2b8\">)</color> ":
 			"<color=\"#95a2b8\">sim(</color> <color=\"#678AC2\">PAUSED</color> <color=\"#95a2b8\">)</color> ";
 
-		output += "<color=\"#95a2b8\">player(</color> <color=\"#4287F5\">"+ Networking.GetOwner(playerTotems[sn_turnid]).displayName + ":" + sn_turnid + "</color> <color=\"#95a2b8\">)</color>";
+		VRCPlayerApi currentOwner = Networking.GetOwner(playerTotems[sn_turnid]);
+		output += "<color=\"#95a2b8\">player(</color> <color=\"#4287F5\">"+ (currentOwner != null? currentOwner.displayName: "[null]") + ":" + sn_turnid + "</color> <color=\"#95a2b8\">)</color>";
 
 		output += "\n---------------------------------------------------------------------------------------------------------------------------------------------------------\n";
 
