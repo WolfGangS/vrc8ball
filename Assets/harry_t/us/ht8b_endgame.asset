@@ -10,16 +10,16 @@ MonoBehaviour:
   m_Enabled: 1
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: c333ccfdd0cbdbc4ca30cef2dd6e6b9b, type: 3}
-  m_Name: ht8b_startgame
+  m_Name: ht8b_endgame
   m_EditorClassIdentifier: 
-  serializedUdonProgramAsset: {fileID: 11400000, guid: 82ded602154266a46be3265b7c46fadc,
+  serializedUdonProgramAsset: {fileID: 11400000, guid: d1bf567ded16d2145b44f41b2f9fb3f2,
     type: 2}
   udonAssembly: 
   assemblyError: 
-  sourceCsScript: {fileID: 11500000, guid: 3523506d5551f074e86926e3f75fdaeb, type: 3}
+  sourceCsScript: {fileID: 11500000, guid: 702c5217a3a9b3e4e91fd77c060e4de2, type: 3}
   behaviourIDHeapVarName: __refl_const_intnl_udonTypeID
   compileErrors: []
-  hasInteractEvent: 0
+  hasInteractEvent: 1
   serializationData:
     SerializedFormat: 2
     SerializedBytes: 

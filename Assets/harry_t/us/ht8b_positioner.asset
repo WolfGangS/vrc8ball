@@ -10,13 +10,13 @@ MonoBehaviour:
   m_Enabled: 1
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: c333ccfdd0cbdbc4ca30cef2dd6e6b9b, type: 3}
-  m_Name: ht8b_startgame
+  m_Name: ht8b_positioner
   m_EditorClassIdentifier: 
-  serializedUdonProgramAsset: {fileID: 11400000, guid: 82ded602154266a46be3265b7c46fadc,
+  serializedUdonProgramAsset: {fileID: 11400000, guid: 12e52f76a9b914d41b90ddfb8f1baba3,
     type: 2}
   udonAssembly: 
   assemblyError: 
-  sourceCsScript: {fileID: 11500000, guid: 3523506d5551f074e86926e3f75fdaeb, type: 3}
+  sourceCsScript: {fileID: 11500000, guid: 04301ee255be6fc4f8b36f2c49f45ee9, type: 3}
   behaviourIDHeapVarName: __refl_const_intnl_udonTypeID
   compileErrors: []
   hasInteractEvent: 0

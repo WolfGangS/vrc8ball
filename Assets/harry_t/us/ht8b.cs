@@ -1,8 +1,6 @@
-﻿//#define USE_FIXED_POINT
-//#define NPACK_8BIT
-#define NPACK_16BIT
+﻿/* 
+ https://www.harrygodden.com
 
-/* 
  Networking Model Information:
 	
 	This implementation of 8 ball is based around passing ownership between clients who are
@@ -43,18 +41,19 @@
 	bit  | x80 . x40 . x20 . x10 . x08 . x04 . x02	| x1 .. x80 . x40 . x20 . x10 . x08 . x04 | x02 | x01 |
 	ball | 15	 14	 13    12    11    10    9    |  7     6     5     4     3    2     1   |  8  | cue |
 
- Networking Layout [ushorts]:
+ Networking Layout:
 
-   Total size: 72 bytes over network
+   Total size: 78 bytes over network // 39 C# wchar
  
-   Bytes			What						Data type
+   Address		What						Data type
   
-	[ 00-15 ]	ball positions			(compressed quantized floats)
-	[ 16-17 ]	cue ball velocity		^
+	[ 0x00  ]	ball positions			(compressed quantized vec2's)
+	[ 0x40  ]	cue ball velocity		^
+	[ 0x44  ]	cue ball angular vel	^
 	
-	[    18 ]	sn_pocketed				uint16 bitmask
+	[ 0x48  ]	sn_pocketed				uint16 bitmask ( above table )
 	
-	[    19 ]	game state flags		| bit #	| mask	| what				| 
+	[ 0x4A  ]	game state flags		| bit #	| mask	| what				| 
 												| 0		| 0x1		| sn_simulating	|
 												| 1		| 0x2		| sn_turnid			|
 												| 2		| 0x4		| sn_foul			|
@@ -62,9 +61,10 @@
 												| 4		| 0x10	| sn_playerxor		|
 												| 5		| 0x20	| sn_gameover		|
 												| 6		| 0x40	| sn_winnerid		|
+												| 7		| 0x80	| sn_permit			|
 												
-	[    20 ]	packet #					uint16
-	[    21 ]	gameid					uint16
+	[ 0x4C  ]	packet #					uint16
+	[ 0x4E  ]	gameid					uint16
 
  Physics Implementation:
 	
@@ -95,6 +95,12 @@
 	The display balls have their position matched, and rotated based on pure rolling model.
 */
 
+// https://feedback.vrchat.com/feature-requests/p/udon-expose-shaderpropertytoid
+// #define USE_INT_UNIFORMS
+
+// Currently unstable..
+// #define HT8B_ALLOW_AUTOSWITCH
+
 using UdonSharp;
 using UnityEngine;
 using UnityEngine.UI;
@@ -104,25 +110,6 @@ using System;
 
 public class ht8b : UdonSharpBehaviour {
 
-// Width of packed objects in # chars
-// c# uses wchar by default so, ushort == char for our purposes
-// if it somehow causes errors in networking, NPACK_8BIT can
-// be defined to switch back to 1char/byte networking
-
-#if NPACK_16BIT
-
- const int NPACK_SHORT_WIDTH = 1;
- const int NPACK_VEC2_WIDTH = 2;
-  
-#endif
-
-#if NPACK_8BIT
-
- const int NPACK_SHORT_WIDTH = 2;
- const int NPACK_VEC2_WIDTH = 4;
-
-#endif
-
 const string FRP_LOW =	"<color=\"#ADADAD\">";
 const string FRP_ERR =	"<color=\"#B84139\">";
 const string FRP_WARN = "<color=\"#DEC521\">";
@@ -130,17 +117,25 @@ const string FRP_YES =	"<color=\"#69D128\">";
 const string FRP_END =	"</color>";
 
 [SerializeField] GameObject[]	balls_render;
-[SerializeField] GameObject	cuetip;
+[SerializeField] public GameObject cuetip;
 [SerializeField] GameObject	guideline;
+[SerializeField] GameObject	guidefspin;
 [SerializeField] GameObject	devhit;
 [SerializeField] Text			ltext;
 
 [SerializeField] Vector2		extraGravy;
 [SerializeField] GameObject[] playerTotems;
+[SerializeField] GameObject[] cueTips;
+[SerializeField] Text[]			playerNames;
+[SerializeField] Renderer		scoreCardRenderer;
 [SerializeField] GameObject	gametable;
 [SerializeField] Renderer		tableRenderer;
 [SerializeField] GameObject	infBaseTransform;
 [SerializeField] Text			infText;
+[SerializeField] GameObject	markerObj;
+[SerializeField] Renderer		markerRender;
+[SerializeField] GameObject	infHowToStart;
+[SerializeField] Renderer[]	cueRenderers;
 
 // Audio Components
 AudioSource aud_main;
@@ -164,20 +159,21 @@ uint sn_pocketed_prv = 0x00;		// -- What was the pocketed balls before we starte
 bool	sn_simulating	= false;		// 19:0 (0x01)		True whilst balls are rolling
 uint	sn_turnid		= 0x00U;		// 19:1 (0x02)		Whos turn is it, 0 or 1
 bool  sn_foul			= false;		// 19:2 (0x04)		End-of-turn foul marker
-bool  sn_open			= false;		// 19:3 (0x08)		Is the table open?
+bool  sn_open			= true;		// 19:3 (0x08)		Is the table open?
 uint  sn_playerxor	= 0x00;		// 19:4 (0x10)		What colour the players have chosen
-bool  sn_gameover		= false;		// 19:5 (0x20)		Game is complete
+bool  sn_gameover		= true;		// 19:5 (0x20)		Game is complete
 uint  sn_winnerid		= 0x00U;		// 19:6 (0x40)		Who won the game if sn_gameover is set
 
 ushort sn_packetid	= 0;			// 20 Current packet number, used for locking updates so we dont accidently go back.
 											//    this behaviour was observed on some long connections so its necessary
 ushort sn_gameid		= 0;			// 21 Game number
 
+public bool	sn_permit= false;		// Permission for player to play
+
 // Local gamestates
 
-bool	sn_armed			= false;
+public bool	sn_armed	= false;
 bool	sn_updatelock	= false;		// We are waiting for our local simulation to finish, before we unpack data
-bool	sn_permit		= false;		// Permission for local player to play
 int	sn_firsthit		= 0;			// The first ball to be hit by cue ball
 
 byte	sn_wins0			= 0;			// Wins for player 0 (unused)
@@ -187,15 +183,42 @@ float	introAminTimer = 0.0f;		// Ball dropper timer
 
 bool	ballsMoving		= false;		// Tracker variable to see if balls are still on the go
 
+bool	isReposition	= false;			// Repositioner is active
+float repoMaxX			= TABLE_WIDTH;	// For clamping to table or set lower for kitchen
+
 // General local aesthetic events
 // =========================================================================================================================
 	
 Color tableSrcColour		= new Color( 1.0f, 1.0f, 1.0f, 1.0f );	// Runtime target colour
 Color tableCurrentColour= new Color( 1.0f, 1.0f, 1.0f, 1.0f );	// Runtime actual colour
-Color tableColourBlue	= new Color( 0.0f, 0.9f, 1.6f, 1.0f ); // Presets ..
-Color tableColourOrange = new Color( 1.6f, 0.7f, 0.0f, 1.0f );
+Color tableColourBlue	= new Color( 0.0f, 0.75f, 1.75f, 1.0f ); // Presets ..
+Color tableColourOrange = new Color( 1.75f, 0.25f, 0.0f, 1.0f );
 Color tableColourRed		= new Color( 1.2f, 0.0f, 0.0f, 1.0f );
 Color tableColorWhite	= new Color( 1.0f, 1.0f, 1.0f, 1.0f );
+Color tableColourBlack	= new Color( 0.04f, 0.04f, 0.04f, 1.0f );
+Color markerColorOK		= new Color( 0.0f, 1.0f, 0.0f, 1.0f );
+Color markerColorNO		= new Color( 1.0f, 0.0f, 0.0f, 1.0f );
+
+// Shader uniforms
+#if USE_INT_UNIFORMS
+
+int uniform_tablecolour;
+int uniform_scorecard_colour0;
+int uniform_scorecard_colour1;
+int uniform_scorecard_info;
+int uniform_marker_colour;
+int uniform_cue_colour;
+
+#else
+
+const string uniform_tablecolour = "_EmissionColour";
+const string uniform_scorecard_colour0 = "_Colour0";
+const string uniform_scorecard_colour1 = "_Colour1";
+const string uniform_scorecard_info = "_Info";
+const string uniform_marker_colour = "_Color";
+const string uniform_cue_colour = "_ReColor";
+
+#endif
 
 // Updates table colour target to appropriate player colour
 void UpdateTableColor( uint idsrc )
@@ -212,16 +235,32 @@ void UpdateTableColor( uint idsrc )
 			// Table colour to orange
 			tableSrcColour = tableColourOrange;
 		}
+
+		cueRenderers[ sn_playerxor ].sharedMaterial.SetColor( uniform_cue_colour, tableColourBlue );
+		cueRenderers[ sn_playerxor ^ 0x1U ].sharedMaterial.SetColor( uniform_cue_colour, tableColourOrange );
+	}
+	else
+	{
+		tableSrcColour = tableColorWhite;
+
+		cueRenderers[ 0 ].sharedMaterial.SetColor( uniform_cue_colour, tableColorWhite );
+		cueRenderers[ 1 ].sharedMaterial.SetColor( uniform_cue_colour, tableColourBlack );
 	}
 }
 
 // Called when a player first sinks a ball whilst the table was previously open
 void DisplaySetLocal()
 {
+	uint picker = sn_turnid ^ sn_playerxor;
+
 	FRP( FRP_YES + "(local) " + Networking.GetOwner( playerTotems[sn_turnid] ).displayName + ":" + sn_turnid + " is " + 
-		((sn_turnid ^ sn_playerxor) == 0? "blues": "oranges") + FRP_END );
+		(picker == 0? "blues": "oranges") + FRP_END );
 
 	UpdateTableColor( sn_turnid );
+	UpdateScoreCardLocal();
+
+	scoreCardRenderer.sharedMaterial.SetColor( uniform_scorecard_colour0, sn_playerxor == 0? tableColourBlue: tableColourOrange );
+	scoreCardRenderer.sharedMaterial.SetColor( uniform_scorecard_colour1, sn_playerxor == 1? tableColourBlue: tableColourOrange );
 }
 
 // End of the game. Both with/loss
@@ -233,6 +272,9 @@ void GameOverLocal()
 
 	infText.text = Networking.GetOwner(playerTotems[sn_winnerid]).displayName + " wins!";
 	infBaseTransform.SetActive( true );
+	infHowToStart.SetActive( true );
+
+	UpdateScoreCardLocal();
 }
 
 void OnTurnChangeLocal()
@@ -242,6 +284,37 @@ void OnTurnChangeLocal()
 	UpdateTableColor( sn_turnid );
 
 	aud_main.PlayOneShot( snd_NewTurn, 1.0f );
+
+	// Register correct cuetip
+	cuetip = cueTips[ sn_turnid ];
+}
+
+void UpdateScoreCardLocal()
+{
+	int[] counter0 = new int[2];
+
+	uint temp = sn_pocketed;
+
+	for( int j = 0; j < 2; j ++ )
+	{
+		for( int i = 0; i < 7; i ++ )
+		{
+			if( (temp & 0x4) > 0 )
+			{
+				counter0[ j ^ sn_playerxor ] ++;
+			}
+
+			temp >>= 1;
+		}
+	}
+
+	// Add black ball if we are winning the thing
+	if( sn_gameover )
+	{
+		counter0[ sn_winnerid ] += (int)((sn_pocketed & 0x2) >> 1);
+	}
+
+	scoreCardRenderer.sharedMaterial.SetVector( uniform_scorecard_info, new Vector4( counter0[0]*0.0625f, counter0[1]*0.0625f, 0.0f, 0.0f ) );
 }
 
 // Player scored an objective ball
@@ -261,18 +334,41 @@ void OnPocketBad()
 	aud_main.PlayOneShot( snd_Sink, 1.0f );
 }
 
+void ShowBalls( bool state )
+{
+	for( int i = 0; i < 16; i ++ )
+	{
+		balls_render[ i ].SetActive( state );
+	}
+}
+
 void NewGameLocal()
 {
 	VRCPlayerApi startPlayer = Networking.GetOwner(playerTotems[0]);
 	FRP( FRP_YES + "(local) " + ( startPlayer != null? startPlayer.displayName: "[null]" ) + " started a new game" + FRP_END );
 
-	// Set table colour to grey
-	tableSrcColour = tableColorWhite;
+	// Put names on the board
+	if( startPlayer != null )
+	{
+		playerNames[0].text = Networking.GetOwner(playerTotems[0]).displayName;
+		playerNames[1].text = Networking.GetOwner(playerTotems[1]).displayName;
+	}
+
+	//tableSrcColour = tableColorWhite;
+	UpdateTableColor( 0 );
 
 	introAminTimer = 2.0f;
 	aud_main.PlayOneShot( snd_Intro, 1.0f );
 
+	// Turn off info
 	infBaseTransform.SetActive( false );
+	infHowToStart.SetActive( false );
+
+	ShowBalls( true );
+
+	UpdateScoreCardLocal();
+
+	isReposition = false;
 }
 
 // REGION PHYSICS ENGINE
@@ -281,8 +377,9 @@ void NewGameLocal()
 // Cue input tracking
 
 Vector3	cue_lpos;
-Vector2	cue_llpos;
-Vector2	cue_vdir;
+Vector3	cue_llpos;
+Vector3	cue_vdir;
+Vector2	cue_shotdir;
 float		cue_fdir;
 
 // Timing
@@ -298,6 +395,7 @@ const float TABLE_HEIGHT	= 0.6096f;					// vertical span of table
 const float BALL_DIAMETRE	= 0.06f;						// width of ball
 const float BALL_1OR			= 16.66666666666666f;	// 1 over ball radius
 const float BALL_RSQR		= 0.0009f;					// ball radius squared
+const float BALL_DSQR		= 0.0036f;					// ball diameter squared
 const float POCKET_RADIUS	= 0.09f;						// Full diameter of pockets (exc ball radi)
 
 const float K_1OR2			= 0.70710678118f;			// 1 over root 2 (normalize +-1,+-1 vector)
@@ -313,6 +411,7 @@ const float FRICTION_EFF	= 0.99f;						// How much to multiply velocity by each 
 Vector2[] ball_co = new Vector2[16];	// Current positions
 Vector2[] ball_og = new Vector2[16];	// Break positions
 Vector2[] ball_vl = new Vector2[16];	// Current velocities
+Vector2	 cue_avl = Vector2.zero;		// Cue ball angular velocity
 
 // Send ball to the gulag
 void PocketBall( int id )
@@ -384,6 +483,20 @@ void ClampBallVelSemi( int id, Vector2 surface )
 	}
 }
 
+// Is cue touching another ball?
+bool CueContacting()
+{
+	for( int i = 1; i < 16; i ++ )
+	{
+		if( (ball_co[0] - ball_co[i]).sqrMagnitude < BALL_DSQR )
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
 // TODO: inline this
 void BallEdges( int id )
 {
@@ -401,7 +514,7 @@ void BallEdges( int id )
 		*    zx, zy:							zz:						zw:
 		*																
 		*  o----o----o  +:  1			\_________/				\_________/
-		*  | -+ | ++ |  -: -1		        |	    /		              /  /
+		*  | -+ | ++ |  -: -1		     |	    /		              /  /
 		*  |----+----|					  -  |  +   |		      -     /   |
 		*  | -- | +- |						  |	   |		          /  +  |
 		*  o----o----o						  |      |             /       |
@@ -575,6 +688,34 @@ bool RayCircle( Vector2 start, Vector2 dir, Vector2 circle )
 	return true;
 }
 
+Vector3 RaySphere_output;
+bool RaySphere( Vector3 start, Vector3 dir, Vector3 sphere )
+{
+	Vector3 nrm = dir.normalized;
+	Vector3 h = sphere - start;
+	float lf = Vector3.Dot( nrm, h );
+	float s = BALL_RSQR - Vector3.Dot(h, h) + lf * lf;
+
+	if( s < 0.0f ) return false;
+
+	s = Mathf.Sqrt( s );
+
+	if( lf < s )
+	{
+		if( lf + s >= 0 )
+		{
+			s = -s;
+		}
+		else
+		{
+			return false;
+		}
+	}
+
+	RaySphere_output = start + nrm * (lf-s);
+	return true;
+}
+
 // Closest point on line from pos
 Vector2 LineProject( Vector2 start, Vector2 dir, Vector2 pos )
 {
@@ -591,24 +732,39 @@ void Owner_NewTurn()
 	{
 		FRP( FRP_LOW + "Game state fixup" + FRP_END );
 
-		if( (sn_pocketed & 0x1U) == 0x1U )
+		// Allow repositioning anywhere
+		isReposition = true;
+		repoMaxX = TABLE_WIDTH;
+		markerObj.SetActive( true );
+
+		// Cue ball is out of play
+		if( (sn_pocketed & 0x1U) != 0 )
 		{
 			ball_co[0] = ball_og[0];
 			ball_vl[0] = Vector2.zero;
+			
+			markerObj.transform.position = Vector3.zero;
 
 			// Save out position
-			NetPack( sn_turnid );
+			// NetPack( sn_turnid );
 
 			// https://vrchat.canny.io/vrchat-udon-closed-alpha-feedback/p/bitwisenot-for-integer-built-in-types
 			// sn_pocketed &= ~0x1U;
 
 			sn_pocketed &= 0xFFFFFFFEU;
 		}
+		else
+		{
+			markerObj.transform.position = new Vector3( ball_co[0].x, 0.0f, ball_co[0].y );
+		}
 	}
 
 	sn_permit = true;
 	sn_foul = false;
 	sn_firsthit = 0;
+
+	// Propogate any updates we made
+	NetPack( sn_turnid );
 }
 
 // once balls stops rolling this is called
@@ -675,10 +831,25 @@ void SimEnd()
 			else
 			{
 				// Check for non-objective
-				if(((0x1 << sn_firsthit) & bmask) == 0x00 && ((bmask & sn_pocketed) != bmask ) && !sn_open)
+				if( !sn_open )
 				{
-					FRP( FRP_ERR + "FOUL: cue hit non objective ball" + FRP_END );
-					sn_foul = true;
+					// TODO: this can probably be reduced down a bit in terms of the amount of
+					// conditional logic here and baked into bitmasks.
+					
+					uint çhkmask = bmask;
+
+					// Append black ball if all set is complete
+					if( (bmask & sn_pocketed) == bmask )
+					{
+						çhkmask |= 0x2U;
+					}
+
+					// Check first hit within mask
+					if( ((0x1 << sn_firsthit) & çhkmask) == 0 )
+					{
+						FRP( FRP_ERR + "FOUL: cue hit non objective ball" + FRP_END );
+						sn_foul = true;
+					}
 				}
 			}
 		}
@@ -785,12 +956,21 @@ void SimEnd()
 			NetRead();
 		}
 	}
+
+	UpdateScoreCardLocal();
 }
 
 // Run one physics iteration for all balls
 void PhysicsUpdate()
 {
 	ballsMoving = false;
+
+	// Cue angular velocity
+	if( (sn_pocketed & 0x1) == 0 )
+	{
+		cue_avl *= 0.96f;
+		ball_vl[0] += cue_avl * FIXED_TIME_STEP;
+	}
 
 	// Run main simulation / inter-ball collision
 	for( int i = 0; i < 16; i ++ )
@@ -834,6 +1014,18 @@ public void EndHit()
 	sn_armed = false;
 }
 
+public void PosFinalize()
+{
+	if( !CueContacting() )
+	{
+		isReposition = false;
+		markerObj.SetActive( false );
+
+		// Save out position to remote clients
+		NetPack( sn_turnid );
+	}
+}
+
 float timeLast;
 float accum;
 
@@ -862,25 +1054,51 @@ private void Update()
 		}
 	}
 
-	// float alpha = accum * TIME_ALPHA;
-
 	// Update rendering objects positions
 	for( int i = 0; i < 16; i ++ )
 	{
 		balls_render[i].transform.position = new Vector3( ball_co[i].x, 0.0f, ball_co[i].y );
 	}
 
-	//Debug.Log( ball_velocities[0].magnitude * FIXED_TIME_STEP );
-		
 	cue_lpos = cuetip.transform.position;
-	Vector2 lpos2 = new Vector2( cue_lpos.x, cue_lpos.z );
-		
-	// Check if we are allowed to play
+	Vector3 lpos2 = cue_lpos;
+
+	// cue ball in world space
+	Vector3 ball0ws = new Vector3(ball_co[0].x, 0.0f, ball_co[0].y);
+	
+	// if shot is prepared for next hit
 	if( sn_permit )
 	{
-		if( sn_armed )
+		bool isContact = false;
+
+		if( isReposition )
 		{
-			float sweep_time_ball = Vector2.Dot( ball_co[0] - cue_llpos, cue_vdir );
+			// Clamp position to table / kitchen
+			Vector3 temp = markerObj.transform.position;
+			temp.x = Mathf.Clamp( temp.x, -TABLE_WIDTH, repoMaxX );
+			temp.z = Mathf.Clamp( temp.z, -TABLE_HEIGHT, TABLE_HEIGHT );
+			temp.y = 0.0f;
+			markerObj.transform.position = temp;
+			markerObj.transform.rotation = Quaternion.identity;
+
+			ball_co[0] = new Vector2( temp.x, temp.z );
+			balls_render[0].transform.position = temp;
+
+			isContact = CueContacting();
+
+			if( isContact )
+			{
+				markerRender.sharedMaterial.SetColor( uniform_marker_colour, markerColorNO );
+			}
+			else
+			{
+				markerRender.sharedMaterial.SetColor( uniform_marker_colour, markerColorOK );
+			}
+		}
+
+		if( sn_armed && !isContact )
+		{
+			float sweep_time_ball = Vector3.Dot( ball0ws - cue_llpos, cue_vdir );
 
 			// Check for potential skips due to low frame rate
 			if( sweep_time_ball > 0.0f && sweep_time_ball < (cue_llpos - lpos2).magnitude )
@@ -889,49 +1107,69 @@ private void Update()
 			}
 
 			// Hit condition is when cuetip is gone inside ball
-			if( (lpos2 - ball_co[0]).sqrMagnitude < BALL_RSQR )
+			if( (lpos2 - ball0ws).sqrMagnitude < BALL_RSQR )
 			{
-				devhit.SetActive( false );
-				guideline.SetActive( false );
+				
 
-				// Compute velocity delta
-				float vel = (lpos2 - cue_llpos).magnitude * 10.0f;
+#if HT8B_ALLOW_AUTOSWITCH
+				// This check is here for stability when using auto-transfer
+				if( Networking.GetOwner( playerTotems[ sn_turnid ] ) == Networking.LocalPlayer )
+#else
+				if( Networking.GetOwner( this.gameObject ) == Networking.LocalPlayer )
+#endif
+				{
+					// Make sure repositioner is turned off if the player decides he just
+					// wanted to hit it without putting it somewhere
+					isReposition = false;
+					markerObj.SetActive( false );
 
-				// weeeeeeee
-				ball_vl[0] = cue_vdir * Mathf.Min( vel, 1.0f ) * 14.0f;
+					devhit.SetActive( false );
+					guideline.SetActive( false );
 
-				// Remove locks
-				sn_armed = false;
-				sn_permit = false;
+					// Compute velocity delta
+					float vel = (lpos2 - cue_llpos).magnitude * 10.0f;
 
-				FRP( FRP_LOW + "Commiting changes" + FRP_END );
+					// weeeeeeee
+					ball_vl[0] = cue_shotdir * Mathf.Min( vel, 1.0f ) * 14.0f;
 
-				// Commit changes
-				sn_simulating = true;
-				sn_pocketed_prv = sn_pocketed;
+					// ball avl is a function of velocity
+					cue_avl = ball_vl[0] * RaySphere_output.y * 33.3333333333f;
 
-				NetPack( sn_turnid );
-				NetRead();
+					// Remove locks
+					sn_armed = false;
+					sn_permit = false;
+
+					FRP( FRP_LOW + "Commiting changes" + FRP_END );
+
+					// Commit changes
+					sn_simulating = true;
+					sn_pocketed_prv = sn_pocketed;
+
+					NetPack( sn_turnid );
+					NetRead();
+				}
 			}
 		}
 		else
 		{
-			cue_vdir = new Vector2( cuetip.transform.forward.z, -cuetip.transform.forward.x ).normalized;
+			cue_vdir = cuetip.transform.forward;//new Vector2( cuetip.transform.forward.z, -cuetip.transform.forward.x ).normalized;
 
 			// Get where the cue will strike the ball
-			if( RayCircle( lpos2, cue_vdir, ball_co[0] ))
+			if( RaySphere( lpos2, cue_vdir, ball0ws ))
 			{
 				guideline.SetActive( true );
 				devhit.SetActive( true );
-				devhit.transform.position = new Vector3( RayCircle_output.x, 0.0f, RayCircle_output.y );
+				devhit.transform.position = RaySphere_output;
+				guidefspin.transform.localScale = new Vector3( RaySphere_output.y * 33.3333333333f, 1.0f, 1.0f );
 
-				Vector2 scuffdir = ( ball_co[0] - RayCircle_output ).normalized * 0.5f;
+				Vector3 scuffdir = ( ball0ws - RaySphere_output ).normalized * 0.5f;
+				cue_shotdir = new Vector2( cue_vdir.x, cue_vdir.z );
 
-				cue_vdir += scuffdir;
-				cue_vdir = cue_vdir.normalized;
+				cue_shotdir += new Vector2( scuffdir.x, scuffdir.z );
+				cue_shotdir = cue_shotdir.normalized;
 
 				// TODO: add scuff offset to vdir
-				cue_fdir = Mathf.Atan2( cue_vdir.y, cue_vdir.x );
+				cue_fdir = Mathf.Atan2( cue_shotdir.y, cue_shotdir.x );
 
 				// Update the prediction line direction
 				guideline.transform.eulerAngles = new Vector3( 0.0f, -cue_fdir * Mathf.Rad2Deg, 0.0f );
@@ -951,13 +1189,16 @@ private void Update()
 	{
 		// Flashing if we won
 		tableCurrentColour = tableSrcColour * (Mathf.Sin( Time.timeSinceLevelLoad * 3.0f) * 0.5f + 1.0f);
+		
+		infBaseTransform.transform.position = new Vector3( 0.0f, Mathf.Sin( Time.timeSinceLevelLoad ) * 0.1f, 0.0f );
+		infBaseTransform.transform.Rotate( Vector3.up, 90.0f * Time.deltaTime );
 	}
 	else
 	{
 		tableCurrentColour = Color.Lerp( tableCurrentColour, tableSrcColour, Time.deltaTime * 3.0f );
 	}
 
-	tableRenderer.sharedMaterial.SetColor("_EmissionColor", tableCurrentColour);
+	tableRenderer.sharedMaterial.SetColor( uniform_tablecolour, tableCurrentColour );
 
 	// Intro animation
 	if( introAminTimer > 0.0f )
@@ -990,35 +1231,43 @@ private void Update()
 			balls_render[i].transform.localScale = new Vector3(aitime, aitime, aitime);
 		}
 	}
-
-	// Spinning text
-	if( sn_gameover )
-	{
-		infBaseTransform.transform.position = new Vector3( 0.0f, Mathf.Sin( Time.timeSinceLevelLoad ) * 0.3f, 0.0f );
-		infBaseTransform.transform.Rotate( Vector3.up, 90.0f * Time.deltaTime );
-	}
 }
 
 private void Start()
 {
 	FRP( FRP_LOW + "Starting" + FRP_END );
 
+#if USE_INT_UNIFORMS
+
+	// Gather shader uniforms
+	uniform_tablecolour = Shader.PropertyToID( "_EmissionColour" );
+	uniform_scorecard_colour0 = Shader.PropertyToID( "_Colour0" );
+	uniform_scorecard_colour1 = Shader.PropertyToID( "_Colour1" );
+	uniform_scorecard_info = Shader.PropertyToID( "_Info" );
+	uniform_marker_colour = Shader.PropertyToID( "_Color" );
+	uniform_cue_colour = Shader.PropertyToID( "_ReColor" );
+	
+#endif
+
+	UpdateTableColor( 0 );
+
 	aud_main = this.GetComponent<AudioSource>();
-	tableRenderer = gametable.GetComponent<Renderer>();
+	//tableRenderer = gametable.GetComponent<Renderer>();
 
 	// turn off guideline
 	guideline.SetActive( false );
 	devhit.SetActive( false );
 	infBaseTransform.SetActive( false );
+	markerObj.SetActive( false );
 
-	// randomize positions and velocities
 	for( int i = 0; i < 16; i ++ ) 
 	{
 		ball_og[i].x = balls_render[i].transform.position.x;
 		ball_og[i].y = balls_render[i].transform.position.z;
+		balls_render[i].SetActive(false);
 	}
 
-	SetupBreak();
+	//SetupBreak();
 
 	NetPack( 0 );
 	NetRead();
@@ -1044,7 +1293,6 @@ public void SetupBreak()
 	{
 		ball_co[ i ] = ball_og[ i ];
 		ball_vl[ i ] = Vector2.zero;
-		balls_render[ i ].SetActive( true );
 	}
 
 	NewGameLocal();
@@ -1061,28 +1309,93 @@ public void SendDebugImpulse()
 	NetRead();
 }
 
+// ** experimental ** yoink turn from other player
+// TODO: maybe review transfer system to instead only use
+// cue IDs.
+
+public void AutoTake0()
+{
+	if( sn_turnid == 0 && sn_permit )
+	{
+		Networking.SetOwner( Networking.LocalPlayer, this.gameObject );
+	}
+}
+
+public void AutoTake1()
+{
+	if( sn_turnid == 1 && sn_permit )
+	{
+		Networking.SetOwner( Networking.LocalPlayer, this.gameObject );
+	}
+}
+
 public void NewGame()
 {
+	// This will get called by all clients who observe the collision
+	// between the two sticks. Therefore extra checks are done to make
+	// sure this only runs predictably
+
 	FRP( FRP_LOW + "(local) NewGame()" + FRP_END );
 
 	if( Networking.GetOwner( playerTotems[0] ) == Networking.LocalPlayer )
 	{
-		FRP( FRP_YES + "Starting new game" + FRP_END );
+		// Check if game in progress
+		if( sn_gameover )
+		{
+			FRP( FRP_YES + "Starting new game" + FRP_END );
 			
-		Networking.SetOwner( Networking.LocalPlayer, this.gameObject );
+			Networking.SetOwner( Networking.LocalPlayer, this.gameObject );
 
-		sn_gameid ++;
+			sn_gameid ++;
 
-		SetupBreak();
-		Owner_NewTurn();
+			SetupBreak();
 
-		// TODO: send which totem ID started the game instead
-		NetPack( 0 );
-		NetRead();
+			// Override allow repositioning within kitchen
+			isReposition = true;
+			repoMaxX = -TABLE_WIDTH * 0.5f;
+			markerObj.transform.position = new Vector3( ball_og[0].x, 0.0f, ball_og[0].y );
+			markerObj.SetActive( true );
+
+			Owner_NewTurn();
+
+			// TODO: send which totem ID started the game instead
+			NetPack( 0 );
+			NetRead();
+		}
+		else
+		{
+			FRP( FRP_WARN + "game in progress" + FRP_END );
+		}
 	}
 	else
 	{
-		FRP( FRP_ERR + "Permission denied, you are not player 0" + FRP_END );
+		// FRP( FRP_WARN + "(local) not player 0" + FRP_END );
+	}
+}
+
+// reset game
+public void ForceEndGame()
+{
+	// Limit reset to totem owners ownly
+	if( Networking.LocalPlayer == Networking.GetOwner( playerTotems[0] ) ||
+		Networking.LocalPlayer == Networking.GetOwner( playerTotems[1] ))
+	{
+		FRP( FRP_WARN + "Ending game early" + FRP_END );
+
+		Networking.SetOwner( Networking.LocalPlayer, this.gameObject );
+
+		sn_gameover = true;
+		sn_simulating = false;
+		sn_permit = false;
+
+		// sn_winnerid		= 0x00U;
+
+		// For good measure in case other clients trigger an event whilst owner
+		sn_packetid += 2;
+
+		GameOverLocal();
+
+		NetPack( sn_turnid );
 	}
 }
 
@@ -1094,14 +1407,7 @@ const float I16_MAXf = 32767.0f;
 // 2 char string from unsigned short
 string EncodeUint16( ushort sh )
 {
-	#if NPACK_16BIT
-		return "" + (char)sh;
-	#else
-		string enc = "";
-		enc += (char)(((uint)sh) & 0xFF);
-		enc += (char)(((uint)sh >> 8) & 0xFF);
-		return enc;
-	#endif
+	return "" + (char)sh;
 }
 
 // 4 char string from Vector2. Encodes floats in: [ -range, range ] to 0-65535
@@ -1116,21 +1422,14 @@ string Encodev2( Vector2 vec, float range )
 // 2 chars at index to ushort
 ushort DecodeUint16( char[] arr, int start )
 {
-	#if NPACK_16BIT
-		return (ushort)arr[start];
-	#else
-		ushort dec = 0x00;
-		dec |= (ushort)((arr[start + 0]) & 0x00FF);
-		dec |= (ushort)(((uint)(arr[start + 1]) << 8) & 0xFF00);
-		return dec; 
-	#endif
+	return (ushort)arr[start];
 }
 
 // Decode 4 chars at index to Vector2. Decodes from 0-65535 to [ -range, range ]
 Vector2 Decodev2( char[] arr, int start, float range )
 {
 	float x = (((float)DecodeUint16(arr, start) - I16_MAXf) / I16_MAXf) * range;
-	float y = (((float)DecodeUint16(arr, start + NPACK_SHORT_WIDTH) - I16_MAXf) / I16_MAXf) * range;
+	float y = (((float)DecodeUint16(arr, start + 1) - I16_MAXf) / I16_MAXf) * range;
 		
 	return new Vector2(x,y);
 } 
@@ -1150,6 +1449,7 @@ public void NetPack( uint _turnid )
 
 	// Cue ball velocity last
 	enc += Encodev2( ball_vl[0], 50.0f );
+	enc += Encodev2( cue_avl, 50.0f );
 
 	// Encode pocketed imformation
 	enc += EncodeUint16( (ushort)(sn_pocketed & 0x0000FFFFU) );
@@ -1163,6 +1463,7 @@ public void NetPack( uint _turnid )
 	flags |= sn_playerxor << 4;
 	if( sn_gameover ) flags |= 0x20U;
 	flags |= sn_winnerid << 6;
+	if( sn_permit ) flags |= 0x80U;
 
 	enc += EncodeUint16( (ushort)flags );
 	enc += EncodeUint16( sn_packetid );
@@ -1179,7 +1480,7 @@ public void NetRead()
 {
 	FRP( FRP_LOW + netstr_hex() + FRP_END );
 
-	if( netstr.Length < 18 * NPACK_VEC2_WIDTH )
+	if( netstr.Length < 39 )
 	{
 		FRP( FRP_WARN + "Sync string too short for decode, skipping\n" + FRP_END );
 		return;
@@ -1188,7 +1489,7 @@ public void NetRead()
 	char[] arr = netstr.ToCharArray();
 		
 	// Throw out updates that are possible errournous
-	ushort nextid = DecodeUint16( arr, 18 * NPACK_VEC2_WIDTH );
+	ushort nextid = DecodeUint16( arr, 0x26 );
 	if( nextid < sn_packetid )
 	{
 		FRP( FRP_WARN + "Packet ID was old ( " + nextid + " < " + sn_packetid + " ). Throwing out update" + FRP_END );
@@ -1196,8 +1497,11 @@ public void NetRead()
 	}
 	sn_packetid = nextid;
 
+	// Pocketed information
+	sn_pocketed = DecodeUint16( arr, 0x24 );
+
 	// Check for new game
-	ushort nextgame = DecodeUint16( arr, 18 * NPACK_VEC2_WIDTH + NPACK_SHORT_WIDTH );
+	ushort nextgame = DecodeUint16( arr, 0x27 );
 	if( nextgame > sn_gameid )
 	{
 		NewGameLocal();
@@ -1207,20 +1511,26 @@ public void NetRead()
 	for( int i = 0; i < 16; i ++ )
 	{
 		ball_vl[i] = Vector2.zero;
-		ball_co[i] = Decodev2( arr, i * NPACK_VEC2_WIDTH, 2.5f );
+		ball_co[i] = Decodev2( arr, i * 2, 2.5f );
 	}
 
-	ball_vl[0] = Decodev2( arr, 16 * NPACK_VEC2_WIDTH, 50.0f );
-
-	// Pocketed information
-	sn_pocketed = DecodeUint16( arr, 17 * NPACK_VEC2_WIDTH );
+	ball_vl[0] = Decodev2( arr, 0x20, 50.0f );
+	cue_avl = Decodev2( arr, 0x22, 50.0f );
 
 	// Game state
-	uint gamestate = DecodeUint16( arr, 17 * NPACK_VEC2_WIDTH + NPACK_SHORT_WIDTH );
+	uint gamestate = DecodeUint16( arr, 0x25 );
 	sn_simulating = (gamestate & 0x1U) == 0x1U;
 	sn_foul = (gamestate & 0x4U) == 0x4U;
 	sn_playerxor = (gamestate & 0x10U) >> 4;
 	sn_winnerid = (gamestate & 0x40U) >> 6;
+	sn_permit = (gamestate & 0x80U) == 0x80U;
+
+	if( !sn_permit )
+	{
+		markerObj.SetActive( false );
+		devhit.SetActive( false );
+		guideline.SetActive( false );
+	}
 
 	bool openlast = sn_open; 
 	sn_open = (gamestate & 0x8U) == 0x8U;
@@ -1233,7 +1543,14 @@ public void NetRead()
 
 		sn_turnid = newturn;
 
-		// Fullfil ownership transfer
+		// Fullfil ownership transfer early
+		// Technically this is not needed with auto-switch mechanism, however its currently
+		// not implemented anywhere else when a turn switch is made and both players are
+		// already holding the respective cues, its not gonna let a player play cause
+		// he doesnt have ownership of the script object
+		//
+		// TODO: Polish the auto-yoink system.
+
 		if( Networking.GetOwner( playerTotems[ sn_turnid ] ) == Networking.LocalPlayer )
 		{
 			FRP( FRP_YES + "Transfered to local" + FRP_END );
@@ -1246,7 +1563,7 @@ public void NetRead()
 			else
 			{
 				// Give our local player permission to play his turn
-				Networking.SetOwner(Networking.LocalPlayer, this.gameObject);
+				Networking.SetOwner( Networking.LocalPlayer, this.gameObject );
 					
 				// Sort out gamestate
 				Owner_NewTurn();
@@ -1283,9 +1600,9 @@ string netstr_hex()
 	char[] arr = netstr.ToCharArray();
 	string str = "";
 
-	for( int i = 0; i < netstr.Length / NPACK_SHORT_WIDTH; i ++ )
+	for( int i = 0; i < netstr.Length; i ++ )
 	{
-		ushort v = DecodeUint16( arr, i * NPACK_SHORT_WIDTH );
+		ushort v = DecodeUint16( arr, i );
 		str += v.ToString("X4");
 	}
 
@@ -1339,7 +1656,7 @@ void FRP( string ln )
 		FRP_LEN = FRP_MAX;
 	}
 
-	string output = "ht8b 0.0.4a ";
+	string output = "ht8b 0.1.2a ";
 		
 	// Add information about game state:
 	output += Networking.IsOwner(Networking.LocalPlayer, this.gameObject) ? 
@@ -1353,7 +1670,7 @@ void FRP( string ln )
 	VRCPlayerApi currentOwner = Networking.GetOwner(playerTotems[sn_turnid]);
 	output += "<color=\"#95a2b8\">player(</color> <color=\"#4287F5\">"+ (currentOwner != null? currentOwner.displayName: "[null]") + ":" + sn_turnid + "</color> <color=\"#95a2b8\">)</color>";
 
-	output += "\n---------------------------------------------------------------------------------------------------------------------------------------------------------\n";
+	output += "\n---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------\n";
 
 	// Update display 
 	for( int i = 0; i < FRP_LEN ; i ++ )
