@@ -1,5 +1,18 @@
-﻿/* 
+/* 
  https://www.harrygodden.com
+
+ live:	wrld_08badc69-7665-4dc5-8243-3867455dc17c
+ dev:		wrld_9497c2da-97ee-4b2e-9f82-f9adb024b6fe
+
+ Update log:
+	16.12.2020 (0.1.3a)	-	Fix for new game, wrong local turn colour
+								-	Fix for not losing match when scratch on pot 8 ball				( Thanks: Photographotter, Mystical )
+								-	Added permission info to console when fail reset
+	17.12.2020 (0.2.0a)	-	Predictive physics for cue ball
+								-  Fix for not winning when sink 8, and objective on same turn		( Thanks: Rosy )
+								-	Reduced code spaghet in decode routine
+								-	Improved algorithm for post-game state checking, should lend
+								   to easier implementation of optional rules.
 
  Networking Model Information:
 	
@@ -152,9 +165,7 @@ AudioSource aud_main;
 					private string netstr_prv;
 
 // Networked game flags
-	
-uint	sn_pocketed		= 0x00;		// 18 Each bit represents each ball, if it has been pocketed or not
-uint sn_pocketed_prv = 0x00;		// -- What was the pocketed balls before we started the simulation
+uint	sn_pocketed		= 0x00U;		// 18 Each bit represents each ball, if it has been pocketed or not
 
 bool	sn_simulating	= false;		// 19:0 (0x01)		True whilst balls are rolling
 uint	sn_turnid		= 0x00U;		// 19:1 (0x02)		Whos turn is it, 0 or 1
@@ -163,15 +174,34 @@ bool  sn_open			= true;		// 19:3 (0x08)		Is the table open?
 uint  sn_playerxor	= 0x00;		// 19:4 (0x10)		What colour the players have chosen
 bool  sn_gameover		= true;		// 19:5 (0x20)		Game is complete
 uint  sn_winnerid		= 0x00U;		// 19:6 (0x40)		Who won the game if sn_gameover is set
+public bool	sn_permit= false;		// 19:7 (0x80)		Permission for player to play
+
+// Ruleset flags
+bool	sn_rs_call8		= false;		//	19:8 (0x100)	Call 8 ball pocket
+bool	sn_rs_call		= false;		//	19:9 (0x200)	Call every pocket
+bool	sn_rs_anyf		= false;		// 19:10(0x400)	Any ball can be hit first by cue ball
 
 ushort sn_packetid	= 0;			// 20 Current packet number, used for locking updates so we dont accidently go back.
 											//    this behaviour was observed on some long connections so its necessary
 ushort sn_gameid		= 0;			// 21 Game number
 
-public bool	sn_permit= false;		// Permission for player to play
+// Cannot making a struct in C#, therefore values are duplicated
+
+uint sn_pocketed_prv;
+bool sn_simulating_prv;
+uint sn_turnid_prv;
+bool sn_foul_prv;
+bool sn_open_prv;
+uint sn_playerxor_prv;
+bool sn_gameover_prv;
+uint sn_winnerid_prv;
+bool sn_permit_prv;
+bool sn_rs_call8_prv;
+bool sn_rs_call_prv;
+bool sn_rs_anyf_prv;
+ushort sn_gameid_prv;
 
 // Local gamestates
-
 public bool	sn_armed	= false;
 bool	sn_updatelock	= false;		// We are waiting for our local simulation to finish, before we unpack data
 int	sn_firsthit		= 0;			// The first ball to be hit by cue ball
@@ -396,6 +426,7 @@ const float BALL_DIAMETRE	= 0.06f;						// width of ball
 const float BALL_1OR			= 16.66666666666666f;	// 1 over ball radius
 const float BALL_RSQR		= 0.0009f;					// ball radius squared
 const float BALL_DSQR		= 0.0036f;					// ball diameter squared
+const float BALL_DSQRPE		= 0.003481f;				// ball diameter squared plus epsilon
 const float POCKET_RADIUS	= 0.09f;						// Full diameter of pockets (exc ball radi)
 
 const float K_1OR2			= 0.70710678118f;			// 1 over root 2 (normalize +-1,+-1 vector)
@@ -589,17 +620,11 @@ void BallEdges( int id )
 // Advance simulation 1 step for ball id
 void BallSimulate( int id )
 {
-	if( !BallInPlay( id ) )
-		return;
-
 	// Apply friction
 	ball_vl[ id ] *= FRICTION_EFF;
 
 	Vector2 mov_delta = ball_vl[id] * FIXED_TIME_STEP;
 	float mov_mag = mov_delta.magnitude;
-
-	// Apply movement
-	ball_co[ id ] += mov_delta;
 
 	// Rotate visual object by pure rolling
 	balls_render[ id ].transform.Rotate( new Vector3( mov_delta.y, 0.0f, -mov_delta.x ) / mov_mag, mov_mag * BALL_1OR * Mathf.Rad2Deg, Space.World );
@@ -607,7 +632,7 @@ void BallSimulate( int id )
 	// ball/ball collisions
 	for( int i = id+1; i < 16; i++ )
 	{
-		if( !BallInPlay( id ) )
+		if( !BallInPlay( i ) )
 			continue;
 
 		Vector2 delta = ball_co[ i ] - ball_co[ id ];
@@ -652,6 +677,57 @@ void BallSimulate( int id )
 		// Put velocity to 0
 		ball_vl[ id ] = Vector2.zero;
 	}
+}
+
+// ( Since v0.2.0a ) Check if we can predict a collision before move update happens to improve accuracy
+bool Cue_PredictiveCollide()
+{
+	// Get what will be the next position
+	Vector2 originalDelta = ball_vl[0]*FIXED_TIME_STEP;
+	Vector2 norm = ball_vl[0].normalized;
+	
+	Vector2 h;
+	float lf, s, nmag;
+
+	// Closest found values
+	float minlf = 9999999.0f;
+	int minid = 0;
+	float mins = 0;
+
+	// Loop balls look for collisions
+	for( int i = 1; i < 16; i ++ )
+	{
+		if( !BallInPlay( i ) )
+			continue;
+
+		h = ball_co[ i ] - ball_co[ 0 ];
+		lf = Vector2.Dot( norm, h );
+		s = BALL_DSQRPE - Vector2.Dot( h, h ) + lf * lf;
+
+		if( s < 0.0f )
+			continue;
+
+		if( lf < minlf )
+		{
+			minlf = lf;
+			minid = i;
+			mins = s;
+		}
+	}
+
+	if( minid > 0 )
+	{
+		nmag = minlf-Mathf.Sqrt( mins );
+
+		// Assign new position if got appropriate magnitude
+		if( nmag * nmag < originalDelta.sqrMagnitude )
+		{
+			ball_co[ 0 ] += norm * nmag;
+			return true;
+		}
+	}
+
+	return false;
 }
 
 // Ray circle intersection
@@ -767,6 +843,64 @@ void Owner_NewTurn()
 	NetPack( sn_turnid );
 }
 
+void SimEnd_Win( uint winner )
+{
+	FRP( FRP_LOW + " -> GAMEOVER" + FRP_END );
+
+	sn_gameover = true;
+	sn_winnerid = winner;
+
+	GameOverLocal();
+
+	NetPack( sn_turnid );
+	NetRead();
+}
+
+void SimEnd_Pass()
+{
+	FRP( FRP_LOW + " -> PASS" + FRP_END );
+
+	NetPack( sn_turnid ^ 0x1U );
+	NetRead();
+}
+
+void SimEnd_Foul()
+{
+	FRP( FRP_LOW + " -> FOUL" + FRP_END );
+
+	sn_foul = true;
+
+	SimEnd_Pass();
+}
+
+void SimEnd_Continue()
+{
+	FRP( FRP_LOW + " -> COTNINUE" + FRP_END );
+
+	// Close table if it was open
+	if( sn_open )
+	{
+		sn_open = false;
+
+		// Player triggered turn xor
+		// check which group has the most sinks and 
+		if((sn_pocketed & 0x1FC) > ((sn_pocketed & 0xFE00) >> 7))
+		{
+			sn_playerxor = sn_turnid;
+		}
+		else
+		{
+			sn_playerxor = sn_turnid ^ 0x1u;
+		}
+
+		DisplaySetLocal();
+	}
+
+	Owner_NewTurn();
+	// NetPack( sn_turnid ); <- this is called in Owner_NewTurn();
+	NetRead();
+}
+
 // once balls stops rolling this is called
 void SimEnd()
 {
@@ -780,184 +914,75 @@ void SimEnd()
 		// Owner state checks
 		FRP( FRP_LOW + "Post-move state checking" + FRP_END );
 
-		// We might need this later
-		uint bmask = 0x1FCU << ((int)(sn_playerxor ^ sn_turnid) * 7);
+		uint bmask = 0xFFFCU;
 
-		// Check for fouls
-		if( (sn_pocketed & 0x1U) == 0x1U )
+		// Quash down the mask if table has closed
+		if( !sn_open )
 		{
-			FRP( FRP_ERR + "FOUL: scratched" + FRP_END );
-			sn_foul = true;
+			bmask = bmask & (0x1FCU << ((int)(sn_playerxor ^ sn_turnid) * 7));
+		}
 
-			// TODO: remove code dupe
-			if(((sn_pocketed & bmask) != bmask && (sn_pocketed & 0x2U) == 0x2U))
+		// Common informations
+		bool isSetComplete = (sn_pocketed & bmask) == bmask;
+		bool isScratch = (sn_pocketed & 0x1U) == 0x1U;
+		bool is8Sink = (sn_pocketed & 0x2U) == 0x2U;
+
+		// Append black to mask if set is done
+		if( isSetComplete )
+		{
+			bmask |= 0x2U;
+		}
+
+		bool isObjectiveSink = (sn_pocketed & bmask) > (sn_pocketed_prv & bmask);
+
+		// Calculate if objective was not hit first
+		bool isWrongHit = ((0x1U << sn_firsthit) & bmask) == 0;
+
+		bool winCondition = isSetComplete && is8Sink;
+		bool foulCondition = isScratch || isWrongHit;
+
+		if( winCondition )
+		{
+			if( foulCondition )
 			{
-				FRP( FRP_ERR + "LOSS: sunk white and black" + FRP_END );
-
-				sn_gameover = true;
-				sn_winnerid = sn_turnid ^ 0x1U;
-
-				GameOverLocal();
-
-				NetPack( sn_turnid );
-				NetRead();
-
-				return;
+				// Loss
+				SimEnd_Win( sn_turnid ^ 0x1U );
+			}
+			else
+			{
+				// Win
+				SimEnd_Win( sn_turnid );
 			}
 		}
-		else if( (sn_pocketed & bmask) != bmask && (sn_pocketed & 0x2U) == 0x2U )
+		else if( is8Sink )
 		{
-			FRP( FRP_ERR + "LOSS: potted 8 ball before completing set" + FRP_END );
-
-			sn_gameover = true;
-			sn_winnerid = sn_turnid ^ 0x1U;
-
-			GameOverLocal();
-
-			NetPack( sn_turnid );
-			NetRead();
-
-			return;
+			// Loss
+			SimEnd_Win( sn_turnid ^ 0x1U );
+		}
+		else if( foulCondition )
+		{
+			// Foul
+			SimEnd_Foul();
+		}
+		else if( isObjectiveSink )
+		{
+			// Continue
+			SimEnd_Continue();
 		}
 		else
 		{
-			// Check first hit rules
-			// No hit
-			if ( sn_firsthit == 0 )
-			{
-				FRP( FRP_ERR + "FOUL: cue diddn't hit anything" + FRP_END );
-				sn_foul = true;
-			}
-			else
-			{
-				// Check for non-objective
-				if( !sn_open )
-				{
-					// TODO: this can probably be reduced down a bit in terms of the amount of
-					// conditional logic here and baked into bitmasks.
-					
-					uint çhkmask = bmask;
-
-					// Append black ball if all set is complete
-					if( (bmask & sn_pocketed) == bmask )
-					{
-						çhkmask |= 0x2U;
-					}
-
-					// Check first hit within mask
-					if( ((0x1 << sn_firsthit) & çhkmask) == 0 )
-					{
-						FRP( FRP_ERR + "FOUL: cue hit non objective ball" + FRP_END );
-						sn_foul = true;
-					}
-				}
-			}
-		}
-
-		if( sn_foul )
-		{
-			// Flip player bit and commit, reciever will take ownership once update propogates
-			FRP( FRP_LOW + "Transferring ownership" + FRP_END );
-
-			NetPack( sn_turnid ^ 0x1U );
-			NetRead();
-		}
-		else
-		{
-			FRP( FRP_YES + "Legal move confirmed" + FRP_END );
-
-			bool oppturn = false;
-
-			// Check if we pocketed a ball that is our type
-			if( sn_open )
-			{
-				// Every ball in game in mainplay is valid
-				if((sn_pocketed & 0xFFFC) > (sn_pocketed_prv & 0xFFFC))
-				{
-					// Player triggered turn xor
-					// check which group has the most sinks and 
-					if((sn_pocketed & 0x1FC) > ((sn_pocketed & 0xFE00) >> 7))
-					{
-						sn_playerxor = sn_turnid;
-						// FRP( FRP_YES + "(local) Player is oranges!" + FRP_END );
-					}
-					else
-					{
-						sn_playerxor = sn_turnid ^ 0x1u;
-						// FRP( FRP_YES + "(local) Player is blues!" + FRP_END );
-					}
-
-					sn_open = false;
-
-					DisplaySetLocal();
-
-					// Update needs to be sent about playerxor etc
-					NetPack( sn_turnid );
-					NetRead();
-				}
-				else
-				{
-					oppturn = true;
-				}
-			}
-			else
-			{
-				// Check we sunk at least one correct ball
-				if((sn_pocketed & bmask) > (sn_pocketed_prv & bmask))
-				{
-					FRP( FRP_YES + "Objective ball sunk, continuing" + FRP_END );
-				}
-				else
-				{
-					if((sn_pocketed & bmask) == bmask && (sn_pocketed & 0x2U) == 0x2U)
-					{
-						FRP( FRP_YES + "(local) Player wins!" + FRP_END );
-
-						sn_gameover = true;
-						sn_winnerid = sn_turnid;
-
-						GameOverLocal();
-
-						NetPack( sn_turnid );
-						NetRead();
-							
-						return;
-					}
-					else
-					{
-						FRP( FRP_LOW + "No objective ball made" + FRP_END );
-						oppturn = true;
-					}
-				}
-			}
-
-			if( oppturn )
-			{
-				FRP( FRP_LOW + "Turn will not be extended, transferring ownership" + FRP_END );
-
-				NetPack(sn_turnid ^ 0x1U);
-				NetRead();
-			}
-			else
-			{
-				// Everything was fine, player can go againf
-				Owner_NewTurn();
-			}
+			// Pass
+			SimEnd_Pass();
 		}
 	}
-	else
+	// Check if there was a network update on hold
+	if( sn_updatelock )
 	{
-		// Check if there was a network update on hold
-		if( sn_updatelock )
-		{
-			FRP( FRP_LOW + "Update was waiting, executing now" + FRP_END );
-			sn_updatelock = false;
+		FRP( FRP_LOW + "Update was waiting, executing now" + FRP_END );
+		sn_updatelock = false;
 
-			NetRead();
-		}
+		NetRead();
 	}
-
-	UpdateScoreCardLocal();
 }
 
 // Run one physics iteration for all balls
@@ -970,12 +995,25 @@ void PhysicsUpdate()
 	{
 		cue_avl *= 0.96f;
 		ball_vl[0] += cue_avl * FIXED_TIME_STEP;
+
+		if( !Cue_PredictiveCollide() )
+		{
+			// Apply movement
+			ball_co[ 0 ] += ball_vl[ 0 ] * FIXED_TIME_STEP;
+		}
+
+		BallSimulate( 0 );
 	}
 
 	// Run main simulation / inter-ball collision
-	for( int i = 0; i < 16; i ++ )
+	for( int i = 1; i < 16; i ++ )
 	{
-		BallSimulate( i );
+		if( BallInPlay( i ) )
+		{
+			ball_co[ i ] += ball_vl[ i ] * FIXED_TIME_STEP;
+			
+			BallSimulate( i );
+		}
 	}
 
 	// Check if simulation has settled
@@ -1233,8 +1271,29 @@ private void Update()
 	}
 }
 
+// Copy current values to previous values, no memcpy here >:(
+void sn_copyprv()
+{
+	// Init _prv states
+	sn_pocketed_prv = sn_pocketed;
+	sn_simulating_prv = sn_simulating;
+	sn_turnid_prv = sn_turnid;
+	sn_foul_prv = sn_foul;
+	sn_open_prv = sn_open;
+	sn_playerxor_prv = sn_playerxor;
+	sn_gameover_prv = sn_gameover;
+	sn_winnerid_prv = sn_winnerid;
+	sn_permit_prv = sn_permit;
+	sn_rs_call8_prv = sn_rs_call8;
+	sn_rs_call_prv = sn_rs_call;
+	sn_rs_anyf_prv = sn_rs_anyf;
+	sn_gameid_prv = sn_gameid;
+}
+
 private void Start()
 {
+	sn_copyprv();
+
 	FRP( FRP_LOW + "Starting" + FRP_END );
 
 #if USE_INT_UNIFORMS
@@ -1397,6 +1456,10 @@ public void ForceEndGame()
 
 		NetPack( sn_turnid );
 	}
+	else
+	{
+		FRP( FRP_ERR + "Reset is availible to: " + Networking.GetOwner( playerTotems[0] ).displayName + " and " + Networking.GetOwner( playerTotems[1] ).displayName + FRP_END );
+	}
 }
 
 // REGION NETWORKING
@@ -1478,6 +1541,7 @@ public void NetPack( uint _turnid )
 // TODO: Clean up this function
 public void NetRead()
 {
+	// CHECK ERROR ===================================================================================================
 	FRP( FRP_LOW + netstr_hex() + FRP_END );
 
 	if( netstr.Length < 39 )
@@ -1497,17 +1561,13 @@ public void NetRead()
 	}
 	sn_packetid = nextid;
 
+	// MAIN DECODE ===================================================================================================
+	sn_copyprv();
+
 	// Pocketed information
 	sn_pocketed = DecodeUint16( arr, 0x24 );
 
-	// Check for new game
-	ushort nextgame = DecodeUint16( arr, 0x27 );
-	if( nextgame > sn_gameid )
-	{
-		NewGameLocal();
-	}
-	sn_gameid = nextgame;
-
+	// Ball positions, reset velocity
 	for( int i = 0; i < 16; i ++ )
 	{
 		ball_vl[i] = Vector2.zero;
@@ -1517,31 +1577,42 @@ public void NetRead()
 	ball_vl[0] = Decodev2( arr, 0x20, 50.0f );
 	cue_avl = Decodev2( arr, 0x22, 50.0f );
 
-	// Game state
 	uint gamestate = DecodeUint16( arr, 0x25 );
 	sn_simulating = (gamestate & 0x1U) == 0x1U;
+	sn_turnid = (gamestate & 0x2U) >> 1;
 	sn_foul = (gamestate & 0x4U) == 0x4U;
+	sn_open = (gamestate & 0x8U) == 0x8U;
 	sn_playerxor = (gamestate & 0x10U) >> 4;
+	sn_gameover = (gamestate & 0x20U) == 0x20U;
 	sn_winnerid = (gamestate & 0x40U) >> 6;
 	sn_permit = (gamestate & 0x80U) == 0x80U;
 
+	sn_gameid = DecodeUint16( arr, 0x27 );
+
+	// Events ==========================================================================================================
+
 	if( !sn_permit )
 	{
+		// EV: 0
+
 		markerObj.SetActive( false );
 		devhit.SetActive( false );
 		guideline.SetActive( false );
 	}
 
-	bool openlast = sn_open; 
-	sn_open = (gamestate & 0x8U) == 0x8U;
+	if( sn_gameid > sn_gameid_prv )
+	{
+		// EV: 1
+
+		NewGameLocal();
+	}
 
 	// Check if turn was transferred
-	uint newturn = (gamestate & 0x2U) >> 1;
-	if( sn_turnid != newturn )
+	if( sn_turnid != sn_turnid_prv )
 	{
-		FRP( FRP_LOW + "Ownership changed" + FRP_END );
+		// EV: 2
 
-		sn_turnid = newturn;
+		FRP( FRP_LOW + "Ownership changed" + FRP_END );
 
 		// Fullfil ownership transfer early
 		// Technically this is not needed with auto-switch mechanism, however its currently
@@ -1581,18 +1652,23 @@ public void NetRead()
 		OnTurnChangeLocal();
 	}
 
-	if(openlast && !sn_open)
+	// Table switches to closed
+	if( sn_open_prv && !sn_open )
 	{
+		// EV: 3
+
 		DisplaySetLocal();
 	}
 
 	// Check if game is over
-	bool gameover = (gamestate & 0x20U) == 0x20U;
-	if (gameover && !sn_gameover)
+	if(!sn_gameover_prv && sn_gameover)
 	{
+		// EV: 4
+
 		GameOverLocal();
 	}
-	sn_gameover = gameover;
+
+	UpdateScoreCardLocal();
 }
 
 string netstr_hex()
@@ -1656,7 +1732,7 @@ void FRP( string ln )
 		FRP_LEN = FRP_MAX;
 	}
 
-	string output = "ht8b 0.1.2a ";
+	string output = "ht8b 0.1.3a ";
 		
 	// Add information about game state:
 	output += Networking.IsOwner(Networking.LocalPlayer, this.gameObject) ? 
