@@ -13,6 +13,8 @@
 								-	Reduced code spaghet in decode routine
 								-	Improved algorithm for post-game state checking, should lend
 								   to easier implementation of optional rules.
+								-	Allow colour switching between UK/USA/Default colour sets
+								-  Grips change colour based on which turn it is
 
  Networking Model Information:
 	
@@ -149,6 +151,9 @@ const string FRP_END =	"</color>";
 [SerializeField] Renderer		markerRender;
 [SerializeField] GameObject	infHowToStart;
 [SerializeField] Renderer[]	cueRenderers;
+[SerializeField] Texture[]		textureSets;
+[SerializeField] Material		ballMaterial;
+[SerializeField] Material[]	CueGripMaterials;
 
 // Audio Components
 AudioSource aud_main;
@@ -185,6 +190,8 @@ ushort sn_packetid	= 0;			// 20 Current packet number, used for locking updates 
 											//    this behaviour was observed on some long connections so its necessary
 ushort sn_gameid		= 0;			// 21 Game number
 
+ushort sn_colourid	= 0;			// 22 Colour set ID
+
 // Cannot making a struct in C#, therefore values are duplicated
 
 uint sn_pocketed_prv;
@@ -200,6 +207,7 @@ bool sn_rs_call8_prv;
 bool sn_rs_call_prv;
 bool sn_rs_anyf_prv;
 ushort sn_gameid_prv;
+ushort sn_colourid_prv;
 
 // Local gamestates
 public bool	sn_armed	= false;
@@ -218,16 +226,62 @@ float repoMaxX			= TABLE_WIDTH;	// For clamping to table or set lower for kitche
 
 // General local aesthetic events
 // =========================================================================================================================
-	
+
+Color k_tableColourBlue	= new Color( 0.0f, 0.75f, 1.75f, 1.0f ); // Presets ..
+Color k_tableColourOrange = new Color( 1.75f, 0.25f, 0.0f, 1.0f );
+Color k_tableColourRed	= new Color( 1.2f, 0.0f, 0.0f, 1.0f );
+Color k_tableColorWhite	= new Color( 1.0f, 1.0f, 1.0f, 1.0f );
+Color k_tableColourBlack= new Color( 0.04f, 0.04f, 0.04f, 1.0f );
+Color k_tableColourYellow = new Color( 2.0f, 1.0f, 0.0f, 1.0f );
+
 Color tableSrcColour		= new Color( 1.0f, 1.0f, 1.0f, 1.0f );	// Runtime target colour
 Color tableCurrentColour= new Color( 1.0f, 1.0f, 1.0f, 1.0f );	// Runtime actual colour
-Color tableColourBlue	= new Color( 0.0f, 0.75f, 1.75f, 1.0f ); // Presets ..
-Color tableColourOrange = new Color( 1.75f, 0.25f, 0.0f, 1.0f );
-Color tableColourRed		= new Color( 1.2f, 0.0f, 0.0f, 1.0f );
-Color tableColorWhite	= new Color( 1.0f, 1.0f, 1.0f, 1.0f );
-Color tableColourBlack	= new Color( 0.04f, 0.04f, 0.04f, 1.0f );
+
 Color markerColorOK		= new Color( 0.0f, 1.0f, 0.0f, 1.0f );
 Color markerColorNO		= new Color( 1.0f, 0.0f, 0.0f, 1.0f );
+
+Color k_gripColourActive = new Color( 0.0f, 0.5f, 1.1f, 1.0f );
+Color k_gripColourInactive = new Color( 0.34f, 0.34f, 0.34f, 1.0f );
+
+// 'Pointer' colours.
+Color pColour0;
+Color pColour1;
+Color pColourErr;
+
+public ushort in_coloursetid = 0;
+
+public void PushColourSet()
+{
+	if( Networking.GetOwner( playerTotems[0] ) == Networking.LocalPlayer || Networking.GetOwner( playerTotems[1] ) == Networking.LocalPlayer )
+	{
+		sn_colourid = in_coloursetid;
+		UpdateColourSources();
+	}
+}
+
+public void UpdateColourSources()
+{
+	ballMaterial.SetTexture( "_MainTex", textureSets[ sn_colourid ] );
+
+	if( sn_colourid == 0 )	// harry_t
+	{
+		pColour0 = k_tableColourBlue;
+		pColour1 = k_tableColourOrange;
+		pColourErr = k_tableColourRed;
+	}
+	else if( sn_colourid == 1 )	// USA
+	{
+		pColour0 = k_tableColorWhite;
+		pColour1 = k_tableColorWhite;
+		pColourErr = k_tableColourRed;
+	}
+	else
+	{
+		pColour0 = k_tableColourRed;
+		pColour1 = k_tableColourYellow;
+		pColourErr = k_tableColourBlack;
+	}
+}
 
 // Shader uniforms
 #if USE_INT_UNIFORMS
@@ -258,24 +312,27 @@ void UpdateTableColor( uint idsrc )
 		if( (idsrc ^ sn_playerxor) == 0 )
 		{
 			// Set table colour to blue
-			tableSrcColour = tableColourBlue;
+			tableSrcColour = pColour0;
 		}
 		else
 		{
 			// Table colour to orange
-			tableSrcColour = tableColourOrange;
+			tableSrcColour = pColour1;
 		}
 
-		cueRenderers[ sn_playerxor ].sharedMaterial.SetColor( uniform_cue_colour, tableColourBlue );
-		cueRenderers[ sn_playerxor ^ 0x1U ].sharedMaterial.SetColor( uniform_cue_colour, tableColourOrange );
+		cueRenderers[ sn_playerxor ].sharedMaterial.SetColor( uniform_cue_colour, pColour0 );
+		cueRenderers[ sn_playerxor ^ 0x1U ].sharedMaterial.SetColor( uniform_cue_colour, pColour1 );
 	}
 	else
 	{
-		tableSrcColour = tableColorWhite;
+		tableSrcColour = k_tableColorWhite;
 
-		cueRenderers[ 0 ].sharedMaterial.SetColor( uniform_cue_colour, tableColorWhite );
-		cueRenderers[ 1 ].sharedMaterial.SetColor( uniform_cue_colour, tableColourBlack );
+		cueRenderers[ 0 ].sharedMaterial.SetColor( uniform_cue_colour, k_tableColorWhite );
+		cueRenderers[ 1 ].sharedMaterial.SetColor( uniform_cue_colour, k_tableColorWhite );
 	}
+
+	CueGripMaterials[ sn_turnid ].SetColor( uniform_marker_colour, k_gripColourActive );
+	CueGripMaterials[ sn_turnid ^ 0x1U ].SetColor( uniform_marker_colour, k_gripColourInactive );
 }
 
 // Called when a player first sinks a ball whilst the table was previously open
@@ -289,8 +346,8 @@ void DisplaySetLocal()
 	UpdateTableColor( sn_turnid );
 	UpdateScoreCardLocal();
 
-	scoreCardRenderer.sharedMaterial.SetColor( uniform_scorecard_colour0, sn_playerxor == 0? tableColourBlue: tableColourOrange );
-	scoreCardRenderer.sharedMaterial.SetColor( uniform_scorecard_colour1, sn_playerxor == 1? tableColourBlue: tableColourOrange );
+	scoreCardRenderer.sharedMaterial.SetColor( uniform_scorecard_colour0, sn_playerxor == 0? pColour0: pColour1 );
+	scoreCardRenderer.sharedMaterial.SetColor( uniform_scorecard_colour1, sn_playerxor == 1? pColour0: pColour1 );
 }
 
 // End of the game. Both with/loss
@@ -359,7 +416,7 @@ void OnPocketGood()
 // Player scored a foul ball (cue, non-objective or 8 before set cleared)
 void OnPocketBad()
 {
-	tableCurrentColour = tableColourRed;
+	tableCurrentColour = pColourErr;
 
 	aud_main.PlayOneShot( snd_Sink, 1.0f );
 }
@@ -1288,6 +1345,7 @@ void sn_copyprv()
 	sn_rs_call_prv = sn_rs_call;
 	sn_rs_anyf_prv = sn_rs_anyf;
 	sn_gameid_prv = sn_gameid;
+	sn_colourid_prv = sn_colourid;
 }
 
 private void Start()
@@ -1307,7 +1365,7 @@ private void Start()
 	uniform_cue_colour = Shader.PropertyToID( "_ReColor" );
 	
 #endif
-
+	UpdateColourSources();
 	UpdateTableColor( 0 );
 
 	aud_main = this.GetComponent<AudioSource>();
@@ -1531,6 +1589,7 @@ public void NetPack( uint _turnid )
 	enc += EncodeUint16( (ushort)flags );
 	enc += EncodeUint16( sn_packetid );
 	enc += EncodeUint16( sn_gameid );
+	enc += EncodeUint16( sn_colourid );
 
 	netstr = enc;
 
@@ -1588,6 +1647,7 @@ public void NetRead()
 	sn_permit = (gamestate & 0x80U) == 0x80U;
 
 	sn_gameid = DecodeUint16( arr, 0x27 );
+	sn_colourid = DecodeUint16( arr, 0x28 );
 
 	// Events ==========================================================================================================
 
@@ -1666,6 +1726,12 @@ public void NetRead()
 		// EV: 4
 
 		GameOverLocal();
+	}
+
+	// Coloursets
+	if(sn_colourid_prv != sn_colourid)
+	{
+		UpdateColourSources();
 	}
 
 	UpdateScoreCardLocal();
