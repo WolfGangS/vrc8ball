@@ -154,6 +154,8 @@ const string FRP_END =	"</color>";
 [SerializeField] Texture[]		textureSets;
 [SerializeField] Material		ballMaterial;
 [SerializeField] Material[]	CueGripMaterials;
+[SerializeField] ht8b_cue[]	gripControllers;
+[SerializeField] Material		guidelineMat;
 
 // Audio Components
 AudioSource aud_main;
@@ -161,7 +163,7 @@ AudioSource aud_main;
 [SerializeField] AudioClip		snd_Intro;
 [SerializeField] AudioClip		snd_Sink;
 [SerializeField] AudioClip[]	snd_Hits;
-[SerializeField] AudioClip		snd_NewTurn;
+[SerializeField] AudioClip		snd_NewTurn; 
 
 // REGION GAME STATE
 // =========================================================================================================================
@@ -500,6 +502,7 @@ Vector2[] ball_co = new Vector2[16];	// Current positions
 Vector2[] ball_og = new Vector2[16];	// Break positions
 Vector2[] ball_vl = new Vector2[16];	// Current velocities
 Vector2	 cue_avl = Vector2.zero;		// Cue ball angular velocity
+public Vector2	dkTargetPos;				// Target for desktop aiming
 
 // Send ball to the gulag
 void PocketBall( int id )
@@ -684,7 +687,8 @@ void BallSimulate( int id )
 	float mov_mag = mov_delta.magnitude;
 
 	// Rotate visual object by pure rolling
-	balls_render[ id ].transform.Rotate( new Vector3( mov_delta.y, 0.0f, -mov_delta.x ) / mov_mag, mov_mag * BALL_1OR * Mathf.Rad2Deg, Space.World );
+	if( id > 0 ) 
+		balls_render[ id ].transform.Rotate( new Vector3( mov_delta.y, 0.0f, -mov_delta.x ) / mov_mag, mov_mag * BALL_1OR * Mathf.Rad2Deg, Space.World );
 
 	// ball/ball collisions
 	for( int i = id+1; i < 16; i++ )
@@ -860,6 +864,8 @@ void Owner_NewTurn()
 {
 	FRP( FRP_YES + "NewTurn()" + FRP_END );
 
+	dk_updatetarget();
+
 	// Fixup game state
 	if( sn_foul )
 	{
@@ -876,7 +882,7 @@ void Owner_NewTurn()
 			ball_co[0] = ball_og[0];
 			ball_vl[0] = Vector2.zero;
 			
-			markerObj.transform.position = Vector3.zero;
+			markerObj.transform.localPosition = Vector3.zero;
 
 			// Save out position
 			// NetPack( sn_turnid );
@@ -888,7 +894,7 @@ void Owner_NewTurn()
 		}
 		else
 		{
-			markerObj.transform.position = new Vector3( ball_co[0].x, 0.0f, ball_co[0].y );
+			markerObj.transform.localPosition = new Vector3( ball_co[0].x, 0.0f, ball_co[0].y );
 		}
 	}
 
@@ -972,11 +978,13 @@ void SimEnd()
 		FRP( FRP_LOW + "Post-move state checking" + FRP_END );
 
 		uint bmask = 0xFFFCU;
+		uint emask = 0x0U;
 
 		// Quash down the mask if table has closed
 		if( !sn_open )
 		{
 			bmask = bmask & (0x1FCU << ((int)(sn_playerxor ^ sn_turnid) * 7));
+			emask = 0x1FCU << ((int)(sn_playerxor ^ sn_turnid ^ 0x1U) * 7);
 		}
 
 		// Common informations
@@ -991,6 +999,7 @@ void SimEnd()
 		}
 
 		bool isObjectiveSink = (sn_pocketed & bmask) > (sn_pocketed_prv & bmask);
+		bool isOpponentSink = (sn_pocketed & emask) > (sn_pocketed_prv & emask);
 
 		// Calculate if objective was not hit first
 		bool isWrongHit = ((0x1U << sn_firsthit) & bmask) == 0;
@@ -1021,7 +1030,7 @@ void SimEnd()
 			// Foul
 			SimEnd_Foul();
 		}
-		else if( isObjectiveSink )
+		else if( isObjectiveSink && !isOpponentSink )
 		{
 			// Continue
 			SimEnd_Continue();
@@ -1109,12 +1118,22 @@ public void EndHit()
 	sn_armed = false;
 }
 
+void dk_updatetarget()
+{
+	// Update desktop targets
+	dkTargetPos = ball_co[ 0 ];
+	
+	gripControllers[ sn_turnid ].dk_cpytarget();
+}
+
 public void PosFinalize()
 {
 	if( !CueContacting() )
 	{
 		isReposition = false;
 		markerObj.SetActive( false );
+
+		dk_updatetarget();
 
 		// Save out position to remote clients
 		NetPack( sn_turnid );
@@ -1152,14 +1171,14 @@ private void Update()
 	// Update rendering objects positions
 	for( int i = 0; i < 16; i ++ )
 	{
-		balls_render[i].transform.position = new Vector3( ball_co[i].x, 0.0f, ball_co[i].y );
+		balls_render[i].transform.localPosition = new Vector3( ball_co[i].x, 0.0f, ball_co[i].y );
 	}
 
-	cue_lpos = cuetip.transform.position;
+	cue_lpos = this.transform.InverseTransformPoint( cuetip.transform.position );
 	Vector3 lpos2 = cue_lpos;
 
-	// cue ball in world space
-	Vector3 ball0ws = new Vector3(ball_co[0].x, 0.0f, ball_co[0].y);
+	// cue ball in 'world space' ( actually, is local space )
+	Vector3 ball0ws = new Vector3( ball_co[0].x, 0.0f, ball_co[0].y );
 	
 	// if shot is prepared for next hit
 	if( sn_permit )
@@ -1169,15 +1188,15 @@ private void Update()
 		if( isReposition )
 		{
 			// Clamp position to table / kitchen
-			Vector3 temp = markerObj.transform.position;
+			Vector3 temp = markerObj.transform.localPosition;
 			temp.x = Mathf.Clamp( temp.x, -TABLE_WIDTH, repoMaxX );
 			temp.z = Mathf.Clamp( temp.z, -TABLE_HEIGHT, TABLE_HEIGHT );
 			temp.y = 0.0f;
-			markerObj.transform.position = temp;
-			markerObj.transform.rotation = Quaternion.identity;
+			markerObj.transform.localPosition = temp;
+			markerObj.transform.localRotation = Quaternion.identity;
 
 			ball_co[0] = new Vector2( temp.x, temp.z );
-			balls_render[0].transform.position = temp;
+			balls_render[0].transform.localPosition = temp;
 
 			isContact = CueContacting();
 
@@ -1204,7 +1223,6 @@ private void Update()
 			// Hit condition is when cuetip is gone inside ball
 			if( (lpos2 - ball0ws).sqrMagnitude < BALL_RSQR )
 			{
-				
 
 #if HT8B_ALLOW_AUTOSWITCH
 				// This check is here for stability when using auto-transfer
@@ -1240,6 +1258,10 @@ private void Update()
 					sn_simulating = true;
 					sn_pocketed_prv = sn_pocketed;
 
+					// Remove desktop locks
+					gripControllers[0].dk_endhit();
+					gripControllers[1].dk_endhit();
+
 					NetPack( sn_turnid );
 					NetRead();
 				}
@@ -1247,14 +1269,14 @@ private void Update()
 		}
 		else
 		{
-			cue_vdir = cuetip.transform.forward;//new Vector2( cuetip.transform.forward.z, -cuetip.transform.forward.x ).normalized;
+			cue_vdir = this.transform.InverseTransformVector( cuetip.transform.forward );//new Vector2( cuetip.transform.forward.z, -cuetip.transform.forward.x ).normalized;
 
 			// Get where the cue will strike the ball
 			if( RaySphere( lpos2, cue_vdir, ball0ws ))
 			{
 				guideline.SetActive( true );
 				devhit.SetActive( true );
-				devhit.transform.position = RaySphere_output;
+				devhit.transform.localPosition = RaySphere_output;
 				guidefspin.transform.localScale = new Vector3( RaySphere_output.y * 33.3333333333f, 1.0f, 1.0f );
 
 				Vector3 scuffdir = ( ball0ws - RaySphere_output ).normalized * 0.5f;
@@ -1267,7 +1289,7 @@ private void Update()
 				cue_fdir = Mathf.Atan2( cue_shotdir.y, cue_shotdir.x );
 
 				// Update the prediction line direction
-				guideline.transform.eulerAngles = new Vector3( 0.0f, -cue_fdir * Mathf.Rad2Deg, 0.0f );
+				guideline.transform.localEulerAngles = new Vector3( 0.0f, -cue_fdir * Mathf.Rad2Deg, 0.0f );
 			}
 			else
 			{
@@ -1285,7 +1307,7 @@ private void Update()
 		// Flashing if we won
 		tableCurrentColour = tableSrcColour * (Mathf.Sin( Time.timeSinceLevelLoad * 3.0f) * 0.5f + 1.0f);
 		
-		infBaseTransform.transform.position = new Vector3( 0.0f, Mathf.Sin( Time.timeSinceLevelLoad ) * 0.1f, 0.0f );
+		infBaseTransform.transform.localPosition = new Vector3( 0.0f, Mathf.Sin( Time.timeSinceLevelLoad ) * 0.1f, 0.0f );
 		infBaseTransform.transform.Rotate( Vector3.up, 90.0f * Time.deltaTime );
 	}
 	else
@@ -1308,21 +1330,21 @@ private void Update()
 			introAminTimer = 0.0f;
 
 		// Cueball drops late
-		temp = balls_render[0].transform.position;
+		temp = balls_render[0].transform.localPosition;
 		atime = Mathf.Clamp(introAminTimer - 0.33f, 0.0f, 1.0f); 
 		aitime = (1.0f - atime);
 		temp.y = Mathf.Abs(Mathf.Cos(atime * 6.29f)) * atime * 0.5f;
-		balls_render[0].transform.position = temp;
+		balls_render[0].transform.localPosition = temp;
 		balls_render[0].transform.localScale = new Vector3(aitime, aitime, aitime);
 
 		for ( int i = 1; i < 16; i ++ )
 		{
-			temp = balls_render[i].transform.position;
+			temp = balls_render[i].transform.localPosition;
 			atime = Mathf.Clamp(introAminTimer - 0.84f - (float)i * 0.03f, 0.0f, 1.0f);
 			aitime = (1.0f - atime);
 
 			temp.y = Mathf.Abs( Mathf.Cos( atime * 6.29f ) ) * atime * 0.5f;
-			balls_render[i].transform.position = temp;
+			balls_render[i].transform.localPosition = temp;
 			balls_render[i].transform.localScale = new Vector3(aitime, aitime, aitime);
 		}
 	}
@@ -1371,6 +1393,8 @@ private void Start()
 	aud_main = this.GetComponent<AudioSource>();
 	//tableRenderer = gametable.GetComponent<Renderer>();
 
+	guidelineMat.SetMatrix( "_BaseTransform", this.transform.worldToLocalMatrix );
+
 	// turn off guideline
 	guideline.SetActive( false );
 	devhit.SetActive( false );
@@ -1379,8 +1403,8 @@ private void Start()
 
 	for( int i = 0; i < 16; i ++ ) 
 	{
-		ball_og[i].x = balls_render[i].transform.position.x;
-		ball_og[i].y = balls_render[i].transform.position.z;
+		ball_og[i].x = balls_render[i].transform.localPosition.x;
+		ball_og[i].y = balls_render[i].transform.localPosition.z;
 		balls_render[i].SetActive(false);
 	}
 
@@ -1470,7 +1494,7 @@ public void NewGame()
 			// Override allow repositioning within kitchen
 			isReposition = true;
 			repoMaxX = -TABLE_WIDTH * 0.5f;
-			markerObj.transform.position = new Vector3( ball_og[0].x, 0.0f, ball_og[0].y );
+			markerObj.transform.localPosition = new Vector3( ball_og[0].x, 0.0f, ball_og[0].y );
 			markerObj.SetActive( true );
 
 			Owner_NewTurn();
@@ -1798,7 +1822,7 @@ void FRP( string ln )
 		FRP_LEN = FRP_MAX;
 	}
 
-	string output = "ht8b 0.1.3a ";
+	string output = "ht8b 0.3.0a ";
 		
 	// Add information about game state:
 	output += Networking.IsOwner(Networking.LocalPlayer, this.gameObject) ? 
