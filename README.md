@@ -21,6 +21,8 @@ Status: no stable prefab build released currently. eta: **2-3 weeks**
 
 The Releases page will include core art assets and game scripts, and can be put in your own world. Credit is not required and everything is licensed under gpl 3.0. All content including art was created by myself.
 
-**Important Note**: Ht8b scripting and shaders **rely** on the assumption of the pool table being at the coordinates: 0,0,0. Placing it elsewhere in the world will lead to broken behaviour
+~~**Important Note**: Ht8b scripting and shaders **rely** on the assumption of the pool table being at the coordinates: 0,0,0. Placing it elsewhere in the world will lead to broken behaviour~~
+
+*fixed this garbage
 
 This is an unfortunate but necessary optimisation step! Sorry!
