@@ -23,6 +23,4 @@ The Releases page will include core art assets and game scripts, and can be put 
 
 ~~**Important Note**: Ht8b scripting and shaders **rely** on the assumption of the pool table being at the coordinates: 0,0,0. Placing it elsewhere in the world will lead to broken behaviour~~
 
-*fixed this garbage
-
-This is an unfortunate but necessary optimisation step! Sorry!
+*fixed this garbage*
